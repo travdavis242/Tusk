@@ -1,5 +1,13 @@
+"use client";
+import {SyncStrip, SyncButton, SyncCenter} from "../components/sync/SyncControls";
+import {openSync} from "../lib/sync/service";
+import { LifeNav, LifeWorkspace, LIFE_VIEWS } from "../components/life/LifeWorkspace";
+import { storage, initializeStorage, retrySaves, startDemo, isDemo } from "./storage";
+import { AI_CONFIGS as AI_PROFILES } from "../lib/ai/configs";
+import { CoachPanel } from "../components/tusk/CoachPanel";
+import { runCoach } from "../lib/ai/framework";
+import { DEMO_RECORDS } from "../lib/ai/demo-data";
 import { useState, useEffect, useRef } from "react";
-import { storage } from "./storage";
 import {
   Home, BookOpen, Calendar as CalendarIcon, Target, BarChart3, Bot,
   Settings as SettingsIcon, RefreshCw, Plus, Check, ChevronRight, ChevronLeft,
@@ -7,7 +15,7 @@ import {
   Filter, LayoutGrid, List as ListIcon, Loader2, GraduationCap, Brain,
   MapPin, Pencil, RotateCcw, Lock, CheckCircle2, History, Trash2,
   Image as ImageIcon, Upload, RotateCw, Sparkles,
-  Briefcase, Activity, HeartPulse, DollarSign, TrendingUp, Dumbbell, Moon, Trophy, ShieldCheck, Wallet,
+  Briefcase, Activity, HeartPulse, DollarSign, TrendingUp, Dumbbell, Moon, Trophy, ShieldCheck, Wallet, Award,
 } from "lucide-react";
 
 const THEME = {
@@ -141,6 +149,15 @@ function uid(prefix = "a") {
   return prefix + "_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+// Shared modal-close safety net: Escape key always closes, regardless of what else is going on.
+function useEscapeToClose(onClose) {
+  useEffect(() => {
+    function handler(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+}
+
 function timeToMinutes(t) {
   if (!t) return null;
   const [h, m] = t.split(":").map(Number);
@@ -190,7 +207,7 @@ function computeDerivedStatus(a) {
   if (a.status === "completed") return "completed";
   if (a.status === "in_progress") return "in_progress";
   const hrs = hoursRemaining(a.due_date, a.due_time);
-  if (a.due_date && hrs !== null && hrs <= 24) return "overdue"; // covers overdue AND due-within-24h (both render red)
+  if (a.due_date && hrs !== null && hrs < 0) return "overdue";
   return "upcoming";
 }
 
@@ -203,20 +220,10 @@ function priorityRank(a) {
   return (overdue ? -10000 : 0) + statusW * 100 + dueW + priorityW * 10;
 }
 
-async function callClaude({ system, messages, mcpServers, maxTokens = 1000 }) {
-  const body = { model: "claude-sonnet-4-6", max_tokens: maxTokens, messages };
-  if (system) body.system = system;
-  if (mcpServers) body.mcp_servers = mcpServers;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error("API error " + res.status);
-  const data = await res.json();
-  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  const mcpResults = (data.content || []).filter((b) => b.type === "mcp_tool_result");
-  return { text, mcpResults, raw: data };
+async function callClaude() {
+  const message = "Use the sector assistant to continue with ChatGPT. Gmail and Calendar sync now runs through your connected ChatGPT plugins.";
+  window.dispatchEvent(new CustomEvent("tusk-notice", {detail: message}));
+  throw new Error(message);
 }
 
 function extractJson(text) {
@@ -464,6 +471,7 @@ function SchoolSector({ onBack }) {
   const [lastSyncResults, setLastSyncResults] = useState(null); // {emails_scanned, ignored_count, already_count, updated, addedIds}
   const [editingCandidate, setEditingCandidate] = useState(null);
   const [showSyncHistory, setShowSyncHistory] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [focusTaskId, setFocusTaskId] = useState(null);
   const [chat, setChat] = useState([
     { role: "assistant", content: "Hi! Ask me things like \"what's due tomorrow?\" or \"what should I work on first?\"" },
@@ -545,60 +553,15 @@ function SchoolSector({ onBack }) {
   }
 
   async function syncTestCalendarEvent(test) {
-    try {
-      const isUpdate = !!test.calendar_event_id;
-      const { text } = await callClaude({
-        mcpServers: [CAL_MCP],
-        maxTokens: 600,
-        messages: [
-          {
-            role: "user",
-            content:
-              (isUpdate
-                ? `Update the existing Google Calendar event with id "${test.calendar_event_id}" on my primary calendar.`
-                : "Create a new all-relevant-details Google Calendar event on my primary calendar.") +
-              ` Title: "🔵 ${test.subject || ""} Test — ${test.title}". Date: ${test.date}. Time: ${test.time || "09:00"}. ` +
-              `Location: ${test.location || "not specified"}. Description should include the teacher (${test.teacher || "n/a"}), topics (${(test.topics || []).join(", ")}), and end with "Managed by Tusk". ` +
-              `Respond with ONLY this JSON, no other text: {"calendar_event_id":""}`,
-          },
-        ],
-      });
-      const parsed = extractJson(text);
-      const newId = parsed && parsed.calendar_event_id ? parsed.calendar_event_id : test.calendar_event_id;
-      setTests((prev) => prev.map((t) => (t.id === test.id ? { ...t, calendar_event_id: newId || t.calendar_event_id, calendar_sync_error: null } : t)));
-    } catch (e) {
-      setTests((prev) => prev.map((t) => (t.id === test.id ? { ...t, calendar_sync_error: "Calendar sync failed — the test was saved, tap to retry." } : t)));
-    }
+    setTests(prev=>prev.map(t=>t.id===test.id?{...t,calendar_sync_error:"Saved in Tusk. Google Calendar connection is required; open School sync for calendar import."}:t));
   }
 
   // ---------- Assignment calendar sync (mirrors the test version) ----------
   async function syncAssignmentCalendarEvent(a) {
-    try {
-      const isUpdate = !!a.calendar_event_id;
-      const { text } = await callClaude({
-        mcpServers: [CAL_MCP],
-        maxTokens: 500,
-        messages: [
-          {
-            role: "user",
-            content:
-              (isUpdate
-                ? `Update the existing Google Calendar event with id "${a.calendar_event_id}" on my primary calendar.`
-                : "Create a new Google Calendar event on my primary calendar.") +
-              ` Title: "📚 ${a.subject || ""} — ${a.title}". Date: ${a.due_date}. Time: ${a.due_time || "23:59"}. ` +
-              `Description should include the teacher (${a.teacher || "n/a"}) and end with "Managed by Tusk". Respond with ONLY this JSON, no other text: {"calendar_event_id":""}`,
-          },
-        ],
-      });
-      const parsed = extractJson(text);
-      const newId = parsed && parsed.calendar_event_id ? parsed.calendar_event_id : a.calendar_event_id;
-      setAssignments((prev) => prev.map((x) => (x.id === a.id ? { ...x, calendar_event_id: newId || x.calendar_event_id, calendar_sync_error: null } : x)));
-    } catch (e) {
-      setAssignments((prev) => prev.map((x) => (x.id === a.id ? { ...x, calendar_sync_error: "Calendar sync failed — the assignment was saved, tap to retry." } : x)));
-    }
+    setAssignments(prev=>prev.map(x=>x.id===a.id?{...x,calendar_sync_error:"Saved in Tusk. Google Calendar connection is required; open School sync for calendar import."}:x));
   }
 
-  // ---------- Gmail discovery: classify into new candidates vs. updates to existing items ----------
+
   function buildCandidatesAndUpdates(items, kind) {
     const existingList = kind === "test" ? tests : assignments;
     const overridable = kind === "test" ? TEST_OVERRIDABLE : ASSIGNMENT_OVERRIDABLE;
@@ -716,136 +679,10 @@ function SchoolSector({ onBack }) {
     setEditingCandidate(null);
   }
 
-  async function runSync() {
-    if (syncState === "syncing") return; // never allow concurrent syncs
-    setSyncState("syncing");
-    setSyncError(null);
-    const startTime = new Date().toISOString();
-    try {
-      const { text, mcpResults } = await callClaude({
-        mcpServers: [GMAIL_MCP, CAL_MCP],
-        maxTokens: 1000,
-        messages: [
-          {
-            role: "user",
-            content:
-              "Search my Gmail (including any ManageBac notification emails) from the last 14 days for school-related messages. " +
-              "Prioritize messages containing words or phrases like: upcoming, new deadline, deadline, due, due date, assignment, homework, project, test, quiz, exam, assessment, submission, reminder, missing, overdue, new task. " +
-              "Also recognize ManageBac emails as academic-task-relevant using the sender, subject and content even when they don't contain those exact words. " +
-              "Search for both brand-new tasks and changes to things that may already be tracked (like a changed deadline). " +
-              "For each relevant email, classify it as type \"test\" (quiz/test/exam) or \"assignment\" (homework/project/essay/etc), and extract: title, subject, teacher, description, due_date (YYYY-MM-DD), due_time (HH:MM 24h if known), priority (low/medium/high/urgent), estimated_minutes (assignments only), topics (array, tests only), assessment_type (tests only — see below), submission_info (how/where to submit, if mentioned), managebac_link (URL if present), instructions (any important instructions), and the gmail message id as source_message_id. " +
-              "For tests, also set assessment_type_confidence to \"high\", \"medium\", or \"low\": " + ASSESSMENT_TYPE_GUIDANCE +
-              "Only create an item when there's reasonable evidence of an actual academic task; leave fields blank instead of guessing, and never invent topics or facts. If something important is ambiguous, set needs_review to true instead of guessing. " +
-              "Do not create or modify any calendar events in this step — just read. Also look on my Google Calendar (primary calendar) for all-day events titled exactly 'Day 1' through 'Day 8' (my school's 8-day rotation) from 7 days ago through 21 days from today, with their dates and day numbers. " +
-              "Report how many emails you scanned in total (emails_scanned) and how many of those you judged unrelated to schoolwork (ignored_count). " +
-              "Finally respond with ONLY a JSON object, no other text, no markdown fences, in this exact shape: " +
-              '{"items":[{"type":"assignment","title":"","subject":"","teacher":"","description":"","due_date":"","due_time":"","priority":"","estimated_minutes":null,"topics":[],"assessment_type":"","assessment_type_confidence":"high","submission_info":"","managebac_link":"","instructions":"","needs_review":false,"source_message_id":""}],"rotation_days":[{"date":"YYYY-MM-DD","day":1}],"emails_scanned":0,"ignored_count":0}',
-          },
-        ],
-      });
-
-      const mcpErrText = detectMcpError(mcpResults);
-      let parsed = extractJson(text);
-      let isPartial = false;
-      let partialProblem = null;
-
-      if (!parsed) {
-        const salvaged = extractPartialItems(text);
-        if (salvaged.length > 0) {
-          parsed = {
-            items: salvaged,
-            rotation_days: [],
-            emails_scanned: extractNumberField(text, "emails_scanned") || 0,
-            ignored_count: extractNumberField(text, "ignored_count") || 0,
-          };
-          isPartial = true;
-          partialProblem = mcpErrText || "The response was cut off before it finished processing every email.";
-        } else {
-          throw new Error(mcpErrText || "Could not parse sync response");
-        }
-      } else if (mcpErrText) {
-        if ((parsed.items || []).length > 0) {
-          isPartial = true;
-          partialProblem = mcpErrText;
-        } else {
-          throw new Error(mcpErrText);
-        }
-      }
-
-      const items = parsed.items || [];
-      const assignmentItems = items.filter((i) => i.type !== "test");
-      const testItems = items.filter((i) => i.type === "test");
-      const aResult = buildCandidatesAndUpdates(assignmentItems, "assignment");
-      const tResult = buildCandidatesAndUpdates(testItems, "test");
-      applyUpdates(aResult.updates, "assignment");
-      applyUpdates(tResult.updates, "test");
-      const newCandidates = [...aResult.newOnes, ...tResult.newOnes];
-      setPendingReview((prev) => [...prev, ...newCandidates]);
-      if (Array.isArray(parsed.rotation_days) && parsed.rotation_days.length) {
-        setRotationDays((prev) => {
-          const map = {};
-          [...prev, ...parsed.rotation_days].forEach((r) => { if (r && r.date && r.day) map[r.date] = { date: r.date, day: Number(r.day) }; });
-          return Object.values(map).sort((a, b) => a.date.localeCompare(b.date));
-        });
-      }
-      const results = {
-        emails_scanned: parsed.emails_scanned || 0,
-        ignored_count: parsed.ignored_count || 0,
-        already_count: aResult.alreadyCount + tResult.alreadyCount,
-        updated: [...aResult.updates, ...tResult.updates],
-        addedIds: newCandidates.map((c) => c.tempId),
-      };
-      const log = {
-        id: uid("log"), start_time: startTime, run_time: new Date().toISOString(),
-        status: isPartial ? "partial" : "success", emails_scanned: results.emails_scanned,
-        new_assignments: aResult.newOnes.length, new_tests: tResult.newOnes.length, updates: results.updated.length,
-        ignored: results.ignored_count, already: results.already_count,
-        error_type: isPartial ? "partial" : null, error_message: isPartial ? partialProblem : null,
-        retry_attempts: consecutiveFailures, completed: true,
-      };
-      setAutomationLogs((prev) => [log, ...prev].slice(0, 20));
-      setLastSyncResults(results);
-      setConsecutiveFailures(0);
-
-      if (isPartial) {
-        setSyncErrorInfo({
-          ...classifySyncError(partialProblem),
-          isPartial: true,
-          resultsSummary: {
-            emails_scanned: results.emails_scanned,
-            added_assignments: aResult.newOnes.length,
-            added_tests: tResult.newOnes.length,
-            updated: results.updated.length,
-            not_processed: null,
-          },
-        });
-        setSyncState("partial");
-      } else {
-        setSyncState("success");
-        setView("syncResults");
-      }
-      setTimeout(() => setSyncState((s) => (s === "success" || s === "partial" ? "idle" : s)), 5000);
-    } catch (e) {
-      const classified = classifySyncError(e);
-      const nextFailures = consecutiveFailures + 1;
-      setConsecutiveFailures(nextFailures);
-      setSyncErrorInfo({ ...classified, isPartial: false });
-      setSyncError(classified.title);
-      setAutomationLogs((prev) => [
-        {
-          id: uid("log"), start_time: startTime, run_time: new Date().toISOString(), status: "failed",
-          emails_scanned: 0, new_assignments: 0, new_tests: 0, updates: 0, ignored: 0, already: 0,
-          error_type: classified.category, error_message: classified.technical, retry_attempts: nextFailures, completed: false,
-        },
-        ...prev,
-      ].slice(0, 20));
-      setSyncState("error");
-      setTimeout(() => setSyncState((s) => (s === "error" ? "idle" : s)), 5000);
-    }
-  }
+  async function runSync() {openSync("school");}
 
   function handleReconnectGmail() {
-    try { window.open("https://claude.ai/settings/connectors", "_blank"); } catch (e) { /* ignore */ }
+    window.dispatchEvent(new CustomEvent("tusk-notice", {detail:"Gmail connection setup is not available in this version. You can still add assignments manually."}));
   }
   function handleRetrySync() {
     setSyncErrorInfo(null);
@@ -862,28 +699,6 @@ function SchoolSector({ onBack }) {
   function handleViewDetailsFromError() {
     setSyncErrorInfo(null);
     setShowSyncHistory(true);
-  }
-
-  async function sendChat() {
-    if (!chatInput.trim() || chatBusy) return;
-    const question = chatInput.trim();
-    setChat((c) => [...c, { role: "user", content: question }]);
-    setChatInput("");
-    setChatBusy(true);
-    try {
-      const slimA = assignments.map((a) => ({ title: a.title, subject: a.subject, due_date: a.due_date, due_time: a.due_time, status: a.status, priority: a.priority, teacher: a.teacher }));
-      const slimT = tests.map((t) => ({ title: t.title, subject: t.subject, date: t.date, time: t.time, topics: t.topics }));
-      const { text } = await callClaude({
-        system: "You are the Tusk schoolwork assistant. You only know about the assignments and tests in the JSON provided. Never invent an assignment, test, or deadline that isn't in the data. If the data doesn't answer the question, say so plainly. Be concise.",
-        messages: [{ role: "user", content: `Today's date: ${new Date().toDateString()}. Assignments: ${JSON.stringify(slimA)}. Tests: ${JSON.stringify(slimT)}\n\nQuestion: ${question}` }],
-        maxTokens: 500,
-      });
-      setChat((c) => [...c, { role: "assistant", content: text || "I couldn't come up with an answer." }]);
-    } catch (e) {
-      setChat((c) => [...c, { role: "assistant", content: "Something went wrong reaching the assistant. Try again." }]);
-    } finally {
-      setChatBusy(false);
-    }
   }
 
   const withDerived = assignments.map((a) => ({ ...a, derivedStatus: computeDerivedStatus(a) }));
@@ -924,14 +739,33 @@ function SchoolSector({ onBack }) {
   }
 
   return (
-    <div style={{ background: THEME.paper, color: THEME.ink }} className="w-full min-h-[700px] flex text-sm">
+    <div style={{ background: THEME.paper, color: THEME.ink }} className="w-full min-h-[700px] flex text-sm relative">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
         .tusk-serif { font-family: 'Zilla Slab', Georgia, serif; }
         .tusk-sans { font-family: 'Inter', system-ui, sans-serif; }
+        .tusk-hamburger { display: none; }
+        .tusk-mobile-backdrop { display: none; }
+        .tusk-sidebar { width: 220px; flex-shrink: 0; }
+        @media (max-width: 820px) {
+          .tusk-sidebar {
+            position: fixed !important; top: 0; left: 0; height: 100%; width: 78% !important;
+            max-width: 280px; z-index: 60; transform: translateX(-105%); transition: transform 0.2s ease;
+          }
+          .tusk-sidebar.tusk-open { transform: translateX(0); }
+          .tusk-hamburger { display: flex !important; }
+          .tusk-mobile-backdrop.tusk-open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 55; }
+          .tusk-main { padding: 16px !important; }
+        }
       `}</style>
-      <Sidebar view={view} setView={setView} studentName={studentName} syncState={syncState} onSync={runSync} pendingCount={pendingReview.length} onBack={onBack} />
-      <main className="flex-1 tusk-sans p-8 overflow-y-auto" style={{ maxHeight: 800 }}>
+      <div className={`tusk-mobile-backdrop ${mobileMenuOpen ? "tusk-open" : ""}`} onClick={() => setMobileMenuOpen(false)} />
+      <div className={mobileMenuOpen ? "tusk-sidebar tusk-open" : "tusk-sidebar"}>
+        <Sidebar view={view} setView={(v) => { setView(v); setMobileMenuOpen(false); }} studentName={studentName} syncState={syncState} onSync={()=>openSync("school")} pendingCount={pendingReview.length} onBack={onBack} onCloseMobile={() => setMobileMenuOpen(false)} />
+      </div>
+      <main className="tusk-main flex-1 min-h-0 tusk-sans p-8 overflow-y-auto" style={{ maxHeight: 800 }}>
+        <button onClick={() => setMobileMenuOpen(true)} className="tusk-hamburger items-center gap-2 text-xs px-3 py-2 rounded-md border mb-4" style={{ borderColor: THEME.line }}>
+          <LayoutGrid size={14} /> Menu
+        </button>
         {syncError && (
           <div className="mb-4 flex items-center gap-2 rounded-md px-3 py-2 text-red-700" style={{ background: "#FDECEC", border: "1px solid #F5C6C6" }}>
             <AlertCircle size={16} /> <span>{syncError}</span>
@@ -942,7 +776,7 @@ function SchoolSector({ onBack }) {
           <Dashboard
             studentName={studentName} dueToday={dueToday} dueSoon={dueSoon} inProgress={inProgress} completedRecent={completedRecent}
             priorityList={priorityList} onStart={(id) => { updateAssignment(id, { status: "in_progress" }); setFocusTaskId(id); setView("focus"); }}
-            onOpenFocus={(id) => { setFocusTaskId(id); setView("focus"); }} lastLog={lastLog} onSync={runSync} syncing={syncing}
+            onOpenFocus={(id) => { setFocusTaskId(id); setView("focus"); }} lastLog={lastLog} onSync={()=>openSync("school")} syncing={syncing}
             todayDayNumber={todayDayNumber} todayPeriods={todayPeriods} upcomingTests={upcomingTests}
             nextTest={nextTest} onRecordQuestion={recordQuestionResult} onGoToTests={() => setView("tests")}
             pendingCount={pendingReview.length} onReviewPending={() => setView("syncResults")}
@@ -960,7 +794,7 @@ function SchoolSector({ onBack }) {
         {view === "tests" && (
           <TestsView
             tests={tests} subjects={subjects} onAdd={() => setShowAddTestModal(true)} onEdit={(t) => setEditTest(t)}
-            onDelete={deleteTest} onResetToEmail={resetTestToEmail} onResyncCalendar={syncTestCalendarEvent}
+            onDelete={deleteTest} onResetToEmail={resetTestToEmail} onResyncCalendar={()=>openSync("school")}
             onSetAssessmentType={(id, type) => updateTest(id, { assessment_type: type })}
             typeFilter={testTypeFilter} setTypeFilter={setTestTypeFilter}
           />
@@ -985,10 +819,10 @@ function SchoolSector({ onBack }) {
           />
         )}
         {view === "progress" && <ProgressView assignments={withDerived} subjects={subjects} />}
-        {view === "assistant" && <AssistantView chat={chat} chatInput={chatInput} setChatInput={setChatInput} onSend={sendChat} busy={chatBusy} />}
+        {view === "assistant" && <CoachPanel config={AI_PROFILES.school}/>}
         {view === "settings" && (
           <SettingsView studentName={studentName} setStudentName={setStudentName} timezone={timezone} setTimezone={setTimezone}
-            automationLogs={automationLogs} onSync={runSync} syncing={syncing} todayDayNumber={todayDayNumber}
+            automationLogs={automationLogs} onSync={()=>openSync("school")} syncing={syncing} todayDayNumber={todayDayNumber}
             onOpenHistory={() => setShowSyncHistory(true)} pendingCount={pendingReview.length} onReviewPending={() => setView("syncResults")}
           />
         )}
@@ -1045,7 +879,7 @@ function SchoolSector({ onBack }) {
   );
 }
 
-function Sidebar({ view, setView, studentName, syncState, onSync, pendingCount, onBack }) {
+function Sidebar({ view, setView, studentName, syncState, onSync, pendingCount, onBack, onCloseMobile }) {
   const items = [
     { id: "dashboard", label: "Dashboard", icon: Home },
     { id: "assignments", label: "Assignments", icon: BookOpen },
@@ -1065,12 +899,17 @@ function Sidebar({ view, setView, studentName, syncState, onSync, pendingCount, 
   }[syncState] || { icon: RefreshCw, label: "Sync", bg: THEME.brass, fg: "#1a1200", spin: false };
   const SyncIcon = syncBtn.icon;
   return (
-    <aside style={{ background: THEME.ink, color: "#EDE9DD", width: 220 }} className="tusk-sans flex-shrink-0 flex flex-col py-6 px-4">
-      {onBack && (
-        <button onClick={onBack} className="flex items-center gap-1 text-xs mb-4 px-1" style={{ color: "#9A957F" }}>
-          <ChevronLeft size={12} /> Tusk Home
-        </button>
-      )}
+    <aside style={{ background: THEME.ink, color: "#EDE9DD" }} className="tusk-sans flex-shrink-0 flex flex-col py-6 px-4 w-full h-full overflow-y-auto">
+      <div className="flex items-center justify-between mb-4">
+        {onBack && (
+          <button onClick={onBack} className="flex items-center gap-1 text-xs px-1" style={{ color: "#9A957F" }}>
+            <ChevronLeft size={12} /> Tusk Home
+          </button>
+        )}
+        {onCloseMobile && (
+          <button onClick={onCloseMobile} className="tusk-hamburger items-center p-1"><X size={16} color="#9A957F" /></button>
+        )}
+      </div>
       <div className="flex items-center gap-2 px-2 mb-8">
         <div style={{ background: THEME.brass }} className="w-8 h-8 rounded flex items-center justify-center tusk-serif font-bold text-white">T</div>
         <span className="tusk-serif text-lg font-semibold tracking-tight">School</span>
@@ -1092,11 +931,11 @@ function Sidebar({ view, setView, studentName, syncState, onSync, pendingCount, 
       </nav>
       <div className="mt-auto pt-6 border-t" style={{ borderColor: "rgba(255,255,255,0.1)" }}>
         <button onClick={onSync} disabled={syncState === "syncing"} className="w-full flex items-center justify-center gap-2 rounded-md py-2 mb-4 font-medium" style={{ background: syncBtn.bg, color: syncBtn.fg }}>
-          <SyncIcon size={14} className={syncBtn.spin ? "animate-spin" : ""} /> {syncBtn.label}
+          <SyncIcon size={14} className={syncBtn.spin ? "animate-spin" : ""} /> Sync School
         </button>
         <div className="text-xs px-1 space-y-1" style={{ color: "#9A957F" }}>
-          <div className="flex items-center gap-2"><Mail size={12} /> Gmail connected</div>
-          <div className="flex items-center gap-2"><CalendarIcon size={12} /> Calendar connected</div>
+          <div className="flex items-center gap-2"><Mail size={12} /> Gmail not connected</div>
+          <div className="flex items-center gap-2"><CalendarIcon size={12} /> Calendar not connected</div>
         </div>
         <div className="mt-4 text-xs px-1" style={{ color: "#7D7968" }}>{studentName}</div>
       </div>
@@ -1546,7 +1385,7 @@ function AssignmentsView({ assignments, subjects, filters, setFilters, subView, 
         </div>
       )}
       {subView === "kanban" && (
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           {["upcoming", "in_progress", "completed"].map((col) => (
             <div key={col}>
               <div className="text-xs uppercase tracking-wide mb-2 font-medium" style={{ color: THEME.inkSoft }}>{col === "upcoming" ? "Upcoming" : col === "in_progress" ? "In progress" : "Done"}</div>
@@ -1676,8 +1515,8 @@ function FocusView({ task, assignments, onSelect, onComplete }) {
   return (
     <div>
       <h1 className="tusk-serif text-2xl font-semibold mb-4">Focus</h1>
-      <div className="grid grid-cols-3 gap-6">
-        <div className="col-span-2 rounded-lg p-6" style={{ background: "white", border: `1px solid ${THEME.line}` }}>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="md:col-span-2 rounded-lg p-6" style={{ background: "white", border: `1px solid ${THEME.line}` }}>
           <div className="text-xs uppercase tracking-wide mb-2" style={{ color: THEME.inkSoft }}>Current task</div>
           <div className="tusk-serif text-xl font-semibold">{task.title}</div>
           <div className="text-sm mt-1" style={{ color: THEME.inkSoft }}>{task.subject} · {fmtDue(task.due_date, task.due_time)}</div>
@@ -1761,26 +1600,6 @@ function ProgressView({ assignments, subjects }) {
   );
 }
 
-function AssistantView({ chat, chatInput, setChatInput, onSend, busy }) {
-  return (
-    <div className="flex flex-col h-full">
-      <h1 className="tusk-serif text-2xl font-semibold mb-4">AI Assistant</h1>
-      <div className="rounded-lg flex-1 p-4 space-y-3 overflow-y-auto mb-3" style={{ background: "white", border: `1px solid ${THEME.line}`, minHeight: 360, maxHeight: 460 }}>
-        {chat.map((m, i) => (
-          <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className="rounded-lg px-3 py-2 text-sm max-w-[75%]" style={{ background: m.role === "user" ? THEME.ink : THEME.paperDeep, color: m.role === "user" ? "white" : THEME.ink }}>{m.content}</div>
-          </div>
-        ))}
-        {busy && <div className="text-xs" style={{ color: THEME.inkSoft }}>Thinking…</div>}
-      </div>
-      <div className="flex gap-2">
-        <input value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && onSend()} placeholder="What's due this week?"
-          className="flex-1 rounded-md px-3 py-2 text-sm outline-none" style={{ background: "white", border: `1px solid ${THEME.line}` }} />
-        <button onClick={onSend} disabled={busy} className="px-4 rounded-md flex items-center justify-center" style={{ background: THEME.ink, color: "white" }}><Send size={14} /></button>
-      </div>
-    </div>
-  );
-}
 
 function SettingsView({ studentName, setStudentName, timezone, setTimezone, automationLogs, onSync, syncing, todayDayNumber, onOpenHistory, pendingCount, onReviewPending }) {
   return (
@@ -1975,8 +1794,8 @@ function SyncErrorModal({ info, repeated, onRetry, onClose, onReconnect, onViewR
   const showReconnect = !isPartial && (repeated || info.category === "auth" || info.category === "access");
 
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.5)" }}>
-      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-md">
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.5)" }} onClick={onClose}>
+      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-md max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 mb-3">
           <AlertTriangle color={iconColor} size={22} />
           <h2 className="tusk-serif text-lg font-semibold">{title}</h2>
@@ -2023,8 +1842,8 @@ function SyncHistoryModal({ logs, onClose }) {
   const statusDot = { success: "🟢", partial: "🟡", failed: "🔴" };
   const statusLabel = { success: "Sync Complete", partial: "Sync Partially Complete", failed: "Sync Failed" };
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto">
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="tusk-serif text-lg font-semibold flex items-center gap-2"><History size={18} /> Sync history</h2>
           <button onClick={onClose}><X size={16} /></button>
@@ -2100,6 +1919,7 @@ function Field({ label, children, meta }) {
 function ScreenshotPanel({ screenshots, setScreenshots, analyzing, onAnalyze, hasAnalyzed, analyzeError }) {
   const fileInputRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
+  const [expanded, setExpanded] = useState(screenshots.length > 0);
 
   useEffect(() => {
     function handlePaste(e) {
@@ -2112,7 +1932,7 @@ function ScreenshotPanel({ screenshots, setScreenshots, analyzing, onAnalyze, ha
           if (file) files.push(file);
         }
       }
-      if (files.length) addFiles(files);
+      if (files.length) { addFiles(files); setExpanded(true); }
     }
     window.addEventListener("paste", handlePaste);
     return () => window.removeEventListener("paste", handlePaste);
@@ -2139,11 +1959,27 @@ function ScreenshotPanel({ screenshots, setScreenshots, analyzing, onAnalyze, ha
     setScreenshots((prev) => prev.filter((s) => s.id !== id));
   }
 
+  if (!expanded) {
+    return (
+      <button
+        onClick={() => setExpanded(true)}
+        className="w-full rounded-lg px-3 py-2 mb-3 flex items-center gap-2 text-xs font-semibold"
+        style={{ background: "#F8FAFC", border: `1px dashed ${THEME.line}`, color: THEME.ink }}
+      >
+        <ImageIcon size={14} color={THEME.brass} /> 📸 Add from screenshot instead
+        {screenshots.length > 0 && <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: THEME.brassSoft }}>{screenshots.length}</span>}
+      </button>
+    );
+  }
+
   return (
-    <div className="rounded-lg p-3 mb-4" style={{ background: "#F8FAFC", border: `1px dashed ${THEME.line}` }}>
-      <div className="flex items-center gap-2 mb-1">
-        <ImageIcon size={14} color={THEME.brass} />
-        <span className="text-xs font-semibold">📸 Add from screenshot</span>
+    <div className="rounded-lg p-3 mb-3" style={{ background: "#F8FAFC", border: `1px dashed ${THEME.line}` }}>
+      <div className="flex items-center justify-between mb-1">
+        <div className="flex items-center gap-2">
+          <ImageIcon size={14} color={THEME.brass} />
+          <span className="text-xs font-semibold">📸 Add from screenshot</span>
+        </div>
+        <button onClick={() => setExpanded(false)} className="text-[11px]" style={{ color: THEME.inkSoft }}>Hide</button>
       </div>
       <p className="text-[11px] mb-2" style={{ color: THEME.inkSoft }}>
         Upload a screenshot of ManageBac, an assignment page, a test announcement, an email, or a school portal — Tusk will read it and fill the form.
@@ -2221,6 +2057,8 @@ function AddAssignmentModal({ subjects, onClose, onSave, initial, isEdit, existi
   const [fieldMeta, setFieldMeta] = useState({});
   const [hasAnalyzed, setHasAnalyzed] = useState(false);
   const [duplicateMatch, setDuplicateMatch] = useState(null);
+  const [fieldTab, setFieldTab] = useState("details");
+  useEscapeToClose(onClose);
 
   async function handleAnalyze() {
     if (screenshots.length === 0) return;
@@ -2265,57 +2103,71 @@ function AddAssignmentModal({ subjects, onClose, onSave, initial, isEdit, existi
   }
 
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="tusk-serif text-lg font-semibold">{isEdit ? "Edit assignment" : "Add assignment"}</h2>
-          <button onClick={onClose}><X size={16} /></button>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg w-full max-w-sm max-h-[85vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 flex-shrink-0" style={{ borderBottom: `1px solid ${THEME.line}`, background: THEME.paper }}>
+          <h2 className="tusk-serif text-base font-semibold">{isEdit ? "Edit assignment" : "Add assignment"}</h2>
+          <button onClick={onClose} className="p-1 rounded-md hover:bg-black/5"><X size={16} /></button>
         </div>
-        {isEdit && initial.source === "gmail" && (
-          <p className="text-xs mb-3 flex items-center gap-1" style={{ color: THEME.inkSoft }}><Lock size={11} /> Fields you change here will be locked against future Gmail sync updates.</p>
-        )}
-        <ScreenshotPanel screenshots={screenshots} setScreenshots={setScreenshots} analyzing={analyzing} onAnalyze={handleAnalyze} hasAnalyzed={hasAnalyzed} analyzeError={analyzeError} />
-        <div className="space-y-3">
-          <Field label="Title" meta={fieldMeta.title}><input className="tusk-input" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>
-          <Field label="Subject" meta={fieldMeta.subject}>
-            <select className="tusk-input" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })}>
-              {subjects.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </Field>
-          <Field label="Teacher" meta={fieldMeta.teacher}><input className="tusk-input" value={form.teacher} onChange={(e) => setForm({ ...form, teacher: e.target.value })} /></Field>
-          <Field label="Description" meta={fieldMeta.description}><textarea className="tusk-input" rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Due date" meta={fieldMeta.due_date}><input type="date" className="tusk-input" value={form.due_date} onChange={(e) => setForm({ ...form, due_date: e.target.value })} /></Field>
-            <Field label="Due time" meta={fieldMeta.due_time}><input type="time" className="tusk-input" value={form.due_time} onChange={(e) => setForm({ ...form, due_time: e.target.value })} /></Field>
+        <div className="px-5 py-3 overflow-y-auto flex-1 min-h-0">
+          {isEdit && initial.source === "gmail" && (
+            <p className="text-xs mb-3 flex items-center gap-1" style={{ color: THEME.inkSoft }}><Lock size={11} /> Fields you change here will be locked against future Gmail sync updates.</p>
+          )}
+          <ScreenshotPanel screenshots={screenshots} setScreenshots={setScreenshots} analyzing={analyzing} onAnalyze={handleAnalyze} hasAnalyzed={hasAnalyzed} analyzeError={analyzeError} />
+          <div className="flex gap-1 mb-3 rounded-md p-1" style={{ background: THEME.paperDeep }}>
+            <button onClick={() => setFieldTab("details")} className="flex-1 text-xs px-2 py-1.5 rounded font-medium" style={{ background: fieldTab === "details" ? "white" : "transparent" }}>Details</button>
+            <button onClick={() => setFieldTab("more")} className="flex-1 text-xs px-2 py-1.5 rounded font-medium" style={{ background: fieldTab === "more" ? "white" : "transparent" }}>More info</button>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Priority" meta={fieldMeta.priority}>
-              <select className="tusk-input" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
-                {["low", "medium", "high", "urgent"].map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
-            </Field>
-            <Field label="Est. minutes" meta={fieldMeta.estimated_minutes}><input type="number" className="tusk-input" value={form.estimated_minutes} onChange={(e) => setForm({ ...form, estimated_minutes: e.target.value })} /></Field>
-          </div>
-          <Field label="Submission info" meta={fieldMeta.submission_info}><input className="tusk-input" value={form.submission_info} onChange={(e) => setForm({ ...form, submission_info: e.target.value })} placeholder="Submit via ManageBac upload" /></Field>
-          <Field label="Instructions" meta={fieldMeta.instructions}><textarea className="tusk-input" rows={2} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
-          <Field label="Link" meta={fieldMeta.links}><input className="tusk-input" value={form.source_url} onChange={(e) => setForm({ ...form, source_url: e.target.value })} /></Field>
+          {fieldTab === "details" && (
+            <div className="space-y-2.5">
+              <Field label="Title" meta={fieldMeta.title}><input className="tusk-input" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>
+              <Field label="Subject" meta={fieldMeta.subject}>
+                <select className="tusk-input" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })}>
+                  {subjects.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </Field>
+              <Field label="Teacher" meta={fieldMeta.teacher}><input className="tusk-input" value={form.teacher} onChange={(e) => setForm({ ...form, teacher: e.target.value })} /></Field>
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Due date" meta={fieldMeta.due_date}><input type="date" className="tusk-input" value={form.due_date} onChange={(e) => setForm({ ...form, due_date: e.target.value })} /></Field>
+                <Field label="Due time" meta={fieldMeta.due_time}><input type="time" className="tusk-input" value={form.due_time} onChange={(e) => setForm({ ...form, due_time: e.target.value })} /></Field>
+              </div>
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Priority" meta={fieldMeta.priority}>
+                  <select className="tusk-input" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
+                    {["low", "medium", "high", "urgent"].map((p) => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                </Field>
+                <Field label="Est. minutes" meta={fieldMeta.estimated_minutes}><input type="number" className="tusk-input" value={form.estimated_minutes} onChange={(e) => setForm({ ...form, estimated_minutes: e.target.value })} /></Field>
+              </div>
+            </div>
+          )}
+          {fieldTab === "more" && (
+            <div className="space-y-2.5">
+              <Field label="Description" meta={fieldMeta.description}><textarea className="tusk-input" rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></Field>
+              <Field label="Submission info" meta={fieldMeta.submission_info}><input className="tusk-input" value={form.submission_info} onChange={(e) => setForm({ ...form, submission_info: e.target.value })} placeholder="Submit via ManageBac upload" /></Field>
+              <Field label="Instructions" meta={fieldMeta.instructions}><textarea className="tusk-input" rows={3} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
+              <Field label="Link" meta={fieldMeta.links}><input className="tusk-input" value={form.source_url} onChange={(e) => setForm({ ...form, source_url: e.target.value })} /></Field>
+            </div>
+          )}
+          <style>{`.tusk-input { width:100%; margin-top:4px; padding:7px 10px; border-radius:6px; border:1px solid ${THEME.line}; font-size:13px; background:white; }`}</style>
         </div>
-        <style>{`.tusk-input { width:100%; margin-top:4px; padding:8px 10px; border-radius:6px; border:1px solid ${THEME.line}; font-size:13px; background:white; }`}</style>
-        {duplicateMatch ? (
-          <DuplicateWarning
-            match={duplicateMatch} kind="assignment"
-            onUpdate={() => { onUpdateExisting && onUpdateExisting(duplicateMatch.id, buildPayload()); }}
-            onCreateAnyway={() => { setDuplicateMatch(null); onSave(buildPayload()); }}
-            onCancel={() => setDuplicateMatch(null)}
-          />
-        ) : (
-          <div className="flex justify-end gap-2 mt-5">
-            <button onClick={onClose} className="text-xs px-3 py-2 rounded-md border" style={{ borderColor: THEME.line }}>Cancel</button>
-            <button onClick={handleSaveClick} className="text-xs px-3 py-2 rounded-md font-medium" style={{ background: THEME.ink, color: "white" }}>
-              {isEdit ? "Save changes" : "Save assignment"}
-            </button>
-          </div>
-        )}
+        <div className="px-5 py-3 flex-shrink-0" style={{ borderTop: `1px solid ${THEME.line}`, background: THEME.paper }}>
+          {duplicateMatch ? (
+            <DuplicateWarning
+              match={duplicateMatch} kind="assignment"
+              onUpdate={() => { onUpdateExisting && onUpdateExisting(duplicateMatch.id, buildPayload()); }}
+              onCreateAnyway={() => { setDuplicateMatch(null); onSave(buildPayload()); }}
+              onCancel={() => setDuplicateMatch(null)}
+            />
+          ) : (
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="text-xs px-3 py-2 rounded-md border" style={{ borderColor: THEME.line }}>Cancel</button>
+              <button onClick={handleSaveClick} className="text-xs px-3 py-2 rounded-md font-medium" style={{ background: THEME.ink, color: "white" }}>
+                {isEdit ? "Save changes" : "Save assignment"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2336,6 +2188,8 @@ function AddTestModal({ subjects, onClose, onSave, initial, isEdit, existingItem
   const [hasAnalyzed, setHasAnalyzed] = useState(false);
   const [duplicateMatch, setDuplicateMatch] = useState(null);
   const [typeError, setTypeError] = useState(false);
+  const [fieldTab, setFieldTab] = useState("details");
+  useEscapeToClose(onClose);
 
   async function handleAnalyze() {
     if (screenshots.length === 0) return;
@@ -2384,68 +2238,82 @@ function AddTestModal({ subjects, onClose, onSave, initial, isEdit, existingItem
   }
 
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="tusk-serif text-lg font-semibold flex items-center gap-2"><GraduationCap size={18} color={TEST_BLUE} /> {isEdit ? "Edit test" : "Add test"}</h2>
-          <button onClick={onClose}><X size={16} /></button>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div style={{ background: THEME.paper }} className="tusk-sans rounded-lg w-full max-w-sm max-h-[85vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 flex-shrink-0" style={{ borderBottom: `1px solid ${THEME.line}`, background: THEME.paper }}>
+          <h2 className="tusk-serif text-base font-semibold flex items-center gap-2"><GraduationCap size={17} color={TEST_BLUE} /> {isEdit ? "Edit test" : "Add test"}</h2>
+          <button onClick={onClose} className="p-1 rounded-md hover:bg-black/5"><X size={16} /></button>
         </div>
-        {isEdit && initial.source === "gmail" && (
-          <p className="text-xs mb-3 flex items-center gap-1" style={{ color: THEME.inkSoft }}><Lock size={11} /> Fields you change here will be locked against future Gmail sync updates.</p>
-        )}
-        <ScreenshotPanel screenshots={screenshots} setScreenshots={setScreenshots} analyzing={analyzing} onAnalyze={handleAnalyze} hasAnalyzed={hasAnalyzed} analyzeError={analyzeError} />
-        <div className="space-y-3">
-          <Field label="Test name" meta={fieldMeta.title}><input className="tusk-input" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Biology Unit Test" /></Field>
-          <AssessmentTypeToggle
-            value={form.assessment_type}
-            onChange={(v) => { setForm({ ...form, assessment_type: v }); setTypeError(false); }}
-            meta={fieldMeta.assessment_type}
-            error={typeError}
-          />
-          <Field label="Subject" meta={fieldMeta.subject}>
-            <select className="tusk-input" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })}>
-              {subjects.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </Field>
-          <Field label="Teacher" meta={fieldMeta.teacher}><input className="tusk-input" value={form.teacher} onChange={(e) => setForm({ ...form, teacher: e.target.value })} /></Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Date" meta={fieldMeta.date}><input type="date" className="tusk-input" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
-            <Field label="Time" meta={fieldMeta.time}><input type="time" className="tusk-input" value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></Field>
+        <div className="px-5 py-3 overflow-y-auto flex-1 min-h-0">
+          {isEdit && initial.source === "gmail" && (
+            <p className="text-xs mb-3 flex items-center gap-1" style={{ color: THEME.inkSoft }}><Lock size={11} /> Fields you change here will be locked against future Gmail sync updates.</p>
+          )}
+          <ScreenshotPanel screenshots={screenshots} setScreenshots={setScreenshots} analyzing={analyzing} onAnalyze={handleAnalyze} hasAnalyzed={hasAnalyzed} analyzeError={analyzeError} />
+          <div className="flex gap-1 mb-3 rounded-md p-1" style={{ background: THEME.paperDeep }}>
+            <button onClick={() => setFieldTab("details")} className="flex-1 text-xs px-2 py-1.5 rounded font-medium" style={{ background: fieldTab === "details" ? "white" : "transparent" }}>Details</button>
+            <button onClick={() => setFieldTab("more")} className="flex-1 text-xs px-2 py-1.5 rounded font-medium" style={{ background: fieldTab === "more" ? "white" : "transparent" }}>More info</button>
           </div>
-          <Field label="Location" meta={fieldMeta.location}><input className="tusk-input" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Room 103" /></Field>
-          <Field label="Topics (comma separated)" meta={fieldMeta.topics}><input className="tusk-input" value={form.topics} onChange={(e) => setForm({ ...form, topics: e.target.value })} placeholder="Cell structure, transport, enzymes" /></Field>
-          <Field label="Description" meta={fieldMeta.description}><textarea className="tusk-input" rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></Field>
-          <Field label="Instructions" meta={fieldMeta.instructions}><textarea className="tusk-input" rows={2} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Priority" meta={fieldMeta.priority}>
-              <select className="tusk-input" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
-                {["low", "medium", "high", "urgent"].map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
-            </Field>
-            <Field label="Reminder">
-              <select className="tusk-input" value={form.reminder} onChange={(e) => setForm({ ...form, reminder: e.target.value })}>
-                {["None", "1 hour before", "1 day before", "2 days before", "1 week before"].map((r) => <option key={r} value={r}>{r}</option>)}
-              </select>
-            </Field>
-          </div>
-          <Field label="Study plan"><textarea className="tusk-input" rows={2} value={form.study_plan} onChange={(e) => setForm({ ...form, study_plan: e.target.value })} placeholder="Review notes Mon, practice problems Tue..." /></Field>
+          {fieldTab === "details" && (
+            <div className="space-y-2.5">
+              <Field label="Test name" meta={fieldMeta.title}><input className="tusk-input" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Biology Unit Test" /></Field>
+              <AssessmentTypeToggle
+                value={form.assessment_type}
+                onChange={(v) => { setForm({ ...form, assessment_type: v }); setTypeError(false); }}
+                meta={fieldMeta.assessment_type}
+                error={typeError}
+              />
+              <Field label="Subject" meta={fieldMeta.subject}>
+                <select className="tusk-input" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })}>
+                  {subjects.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </Field>
+              <Field label="Teacher" meta={fieldMeta.teacher}><input className="tusk-input" value={form.teacher} onChange={(e) => setForm({ ...form, teacher: e.target.value })} /></Field>
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Date" meta={fieldMeta.date}><input type="date" className="tusk-input" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
+                <Field label="Time" meta={fieldMeta.time}><input type="time" className="tusk-input" value={form.time} onChange={(e) => setForm({ ...form, time: e.target.value })} /></Field>
+              </div>
+              <Field label="Location" meta={fieldMeta.location}><input className="tusk-input" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Room 103" /></Field>
+            </div>
+          )}
+          {fieldTab === "more" && (
+            <div className="space-y-2.5">
+              <Field label="Topics (comma separated)" meta={fieldMeta.topics}><input className="tusk-input" value={form.topics} onChange={(e) => setForm({ ...form, topics: e.target.value })} placeholder="Cell structure, transport, enzymes" /></Field>
+              <Field label="Description" meta={fieldMeta.description}><textarea className="tusk-input" rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></Field>
+              <Field label="Instructions" meta={fieldMeta.instructions}><textarea className="tusk-input" rows={2} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
+              <div className="grid grid-cols-2 gap-2.5">
+                <Field label="Priority" meta={fieldMeta.priority}>
+                  <select className="tusk-input" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
+                    {["low", "medium", "high", "urgent"].map((p) => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                </Field>
+                <Field label="Reminder">
+                  <select className="tusk-input" value={form.reminder} onChange={(e) => setForm({ ...form, reminder: e.target.value })}>
+                    {["None", "1 hour before", "1 day before", "2 days before", "1 week before"].map((r) => <option key={r} value={r}>{r}</option>)}
+                  </select>
+                </Field>
+              </div>
+              <Field label="Study plan"><textarea className="tusk-input" rows={2} value={form.study_plan} onChange={(e) => setForm({ ...form, study_plan: e.target.value })} placeholder="Review notes Mon, practice problems Tue..." /></Field>
+            </div>
+          )}
+          <style>{`.tusk-input { width:100%; margin-top:4px; padding:7px 10px; border-radius:6px; border:1px solid ${THEME.line}; font-size:13px; background:white; }`}</style>
         </div>
-        <style>{`.tusk-input { width:100%; margin-top:4px; padding:8px 10px; border-radius:6px; border:1px solid ${THEME.line}; font-size:13px; background:white; }`}</style>
-        {duplicateMatch ? (
-          <DuplicateWarning
-            match={duplicateMatch} kind="test"
-            onUpdate={() => { onUpdateExisting && onUpdateExisting(duplicateMatch.id, buildPayload()); }}
-            onCreateAnyway={() => { setDuplicateMatch(null); onSave(buildPayload()); }}
-            onCancel={() => setDuplicateMatch(null)}
-          />
-        ) : (
-          <div className="flex justify-end gap-2 mt-5">
-            <button onClick={onClose} className="text-xs px-3 py-2 rounded-md border" style={{ borderColor: THEME.line }}>Cancel</button>
-            <button onClick={handleSaveClick} className="text-xs px-3 py-2 rounded-md font-medium text-white" style={{ background: TEST_BLUE }}>
-              {isEdit ? "Save changes" : "Save Test + Add to Calendar"}
-            </button>
-          </div>
-        )}
+        <div className="px-5 py-3 flex-shrink-0" style={{ borderTop: `1px solid ${THEME.line}`, background: THEME.paper }}>
+          {duplicateMatch ? (
+            <DuplicateWarning
+              match={duplicateMatch} kind="test"
+              onUpdate={() => { onUpdateExisting && onUpdateExisting(duplicateMatch.id, buildPayload()); }}
+              onCreateAnyway={() => { setDuplicateMatch(null); onSave(buildPayload()); }}
+              onCancel={() => setDuplicateMatch(null)}
+            />
+          ) : (
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="text-xs px-3 py-2 rounded-md border" style={{ borderColor: THEME.line }}>Cancel</button>
+              <button onClick={handleSaveClick} className="text-xs px-3 py-2 rounded-md font-medium text-white" style={{ background: TEST_BLUE }}>
+                {isEdit ? "Save changes" : "Save test to Tusk calendar"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2463,6 +2331,51 @@ const SECTOR_META = {
   health: { label: "Health & Wellness", icon: HeartPulse, color: "#A855F7", storageKey: "tusk-health-data" },
 };
 
+/* ---------------------------- Shared AI architecture ----------------------------
+   AIProfile: personality + rules per sector, shared by one AIProvider (callSectorAI).
+   PermissionManager: one small cross-sector permission matrix, shared by every AI
+   and readable/writable from any sector's privacy panel.
+   ------------------------------------------------------------------------------- */
+
+
+const DEFAULT_PERMISSIONS = {
+  schoolToBusiness: false,
+  schoolToSports: false,
+  schoolToHealth: false,
+  sportsToHealth: false,
+  businessToHealth: false,
+  healthToSchool: false,
+  healthToBusiness: false,
+  healthToSports: false,
+};
+const PERMISSIONS_KEY = "tusk-permissions";
+
+async function getPermissions() {
+  const data = await readSectorStorage(PERMISSIONS_KEY);
+  return { ...DEFAULT_PERMISSIONS, ...(data || {}) };
+}
+async function setPermission(key, value) {
+  const current = await getPermissions();
+  const next = { ...current, [key]: value };
+  await storage.set(PERMISSIONS_KEY, JSON.stringify(next)).catch(() => {});
+  window.dispatchEvent(new Event("tusk-permissions-changed"));
+  return next;
+}
+
+function PermissionRow({ label, description, value, onToggle, color }) {
+  return (
+    <div className="rounded-md p-3 flex items-center justify-between gap-3" style={{ background: "white", border: "1px solid #DAD5C8" }}>
+      <div>
+        <div className="text-sm">{label}</div>
+        {description && <div className="text-xs" style={{ color: "#3C4A66" }}>{description}</div>}
+      </div>
+      <button onClick={onToggle} className="text-xs px-3 py-1 rounded-full font-medium flex-shrink-0" style={{ background: value ? color : "#EBE8DF", color: value ? "white" : "#3C4A66" }}>
+        {value ? "Enabled" : "Disabled"}
+      </button>
+    </div>
+  );
+}
+
 async function readSectorStorage(key) {
   try {
     const res = await storage.get(key);
@@ -2472,64 +2385,8 @@ async function readSectorStorage(key) {
   }
 }
 
-function TuskHome({ onNavigate }) {
-  const nodes = [
-    { id: "school", pos: "top-left" },
-    { id: "business", pos: "top-right" },
-    { id: "sports", pos: "bottom-left" },
-    { id: "health", pos: "bottom-right" },
-  ];
-  const posStyle = {
-    "top-left": { top: "6%", left: "8%" },
-    "top-right": { top: "6%", right: "8%" },
-    "bottom-left": { bottom: "6%", left: "8%" },
-    "bottom-right": { bottom: "6%", right: "8%" },
-  };
-  return (
-    <div className="tusk-home w-full flex items-center justify-center relative overflow-hidden tusk-sans" style={{ background: "#05070C" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-        .tusk-serif { font-family: 'Zilla Slab', Georgia, serif; }
-        .tusk-sans { font-family: 'Inter', system-ui, sans-serif; }
-      `}</style>
-      <button onClick={() => onNavigate("assistant")} className="absolute top-5 right-5 flex items-center gap-2 text-xs px-3 py-2 rounded-full font-medium z-10"
-        style={{ background: "rgba(255,255,255,0.08)", color: "#EDE9DD", border: "1px solid rgba(255,255,255,0.15)" }}>
-        <Sparkles size={13} /> AI Personal Assistant
-      </button>
-
-      <div className="tusk-home-layout relative">
-        {nodes.map((n) => {
-          const meta = SECTOR_META[n.id];
-          const Icon = meta.icon;
-          return (
-            <div key={n.id} className="absolute" style={posStyle[n.pos]}>
-              <button
-                onClick={() => onNavigate(n.id)}
-                className="tusk-sector-node rounded-full flex flex-col items-center justify-center transition-transform hover:scale-105"
-                style={{
-                  background: "#05070C",
-                  border: `2px solid ${meta.color}`,
-                  boxShadow: `0 0 30px ${meta.color}55, inset 0 0 20px ${meta.color}22`,
-                }}
-              >
-                <Icon size={40} color="white" strokeWidth={1.5} />
-                <span className="text-xs sm:text-sm font-medium mt-2 text-white">{meta.label}</span>
-              </button>
-            </div>
-          );
-        })}
-
-        {/* center node */}
-        <div className="absolute" style={{ top: "50%", left: "50%", transform: "translate(-50%, -50%)" }}>
-          <div className="tusk-center-node rounded-full flex flex-col items-center justify-center"
-            style={{ background: "#05070C", border: "2px solid #3B82F6", boxShadow: "0 0 40px #3B82F655, inset 0 0 24px #3B82F633" }}>
-            <span style={{ fontSize: 34 }}>🦷</span>
-            <span className="tusk-serif text-2xl font-semibold mt-1 text-white">Tusk</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+function TuskHome({onNavigate}) {
+ return <main className="life-workspace"><header className="life-hero"><img src="/tusk-home.png" alt="Ivory tusk sculpture with blue and gold light"/><div><span>YOUR WORLD, IN ONE PLACE</span><h1>Room to grow.</h1><p>School. Ambition. Performance. Wellbeing.</p><button onClick={()=>onNavigate('today')}>Open today</button></div></header><SyncStrip/><div className="life-sector-grid">{Object.entries(SECTOR_META).map(([key,meta])=>{const Icon=meta.icon;return <button key={key} onClick={()=>onNavigate(key)} style={{'--sector-color':meta.color}}><Icon size={30}/><h2>{meta.label}</h2><p>{AI_PROFILES[key].name}</p></button>;})}</div></main>;
 }
 
 function SectorShell({ title, color, icon: Icon, onBack, children, tabs, activeTab, setActiveTab, right }) {
@@ -2539,8 +2396,16 @@ function SectorShell({ title, color, icon: Icon, onBack, children, tabs, activeT
         @import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
         .tusk-serif { font-family: 'Zilla Slab', Georgia, serif; }
         .tusk-sans { font-family: 'Inter', system-ui, sans-serif; }
+        .tusk-shell-tabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        .tusk-shell-tabs button { flex-shrink: 0; white-space: nowrap; }
+        .tusk-shell-body { padding: 24px; }
+        @media (max-width: 640px) {
+          .tusk-shell-header { padding: 12px 16px !important; flex-direction: column; align-items: flex-start !important; gap: 8px; }
+          .tusk-shell-body { padding: 14px !important; }
+          .tusk-shell-tabs { padding-left: 12px !important; padding-right: 12px !important; }
+        }
       `}</style>
-      <div className="flex items-center justify-between px-6 py-4" style={{ background: color, color: "white" }}>
+      <div className="tusk-shell-header flex items-center justify-between px-6 py-4 flex-wrap gap-2" style={{ background: color, color: "white" }}>
         <div className="flex items-center gap-3">
           <button onClick={onBack} className="flex items-center gap-1 text-xs opacity-90"><ChevronLeft size={14} /> Tusk Home</button>
           <div className="w-px h-4" style={{ background: "rgba(255,255,255,0.4)" }} />
@@ -2550,7 +2415,7 @@ function SectorShell({ title, color, icon: Icon, onBack, children, tabs, activeT
         {right}
       </div>
       {tabs && (
-        <div className="flex gap-1 px-6 pt-3" style={{ background: "white", borderBottom: "1px solid #DAD5C8" }}>
+        <div className="tusk-shell-tabs flex gap-1 px-6 pt-3" style={{ background: "white", borderBottom: "1px solid #DAD5C8" }}>
           {tabs.map((t) => (
             <button key={t.id} onClick={() => setActiveTab(t.id)} className="text-xs px-3 py-2 rounded-t-md font-medium"
               style={{ background: activeTab === t.id ? "#F4F2EC" : "transparent", color: activeTab === t.id ? color : "#3C4A66", borderBottom: activeTab === t.id ? `2px solid ${color}` : "2px solid transparent" }}>
@@ -2559,54 +2424,12 @@ function SectorShell({ title, color, icon: Icon, onBack, children, tabs, activeT
           ))}
         </div>
       )}
-      <div className="flex-1 p-6 overflow-y-auto" style={{ maxHeight: 720 }}>{children}</div>
+      <div className="tusk-shell-body flex-1 min-h-0 overflow-y-auto" >{children}</div>
     </div>
   );
 }
 
-function SectorAssistant({ color, systemPrompt, contextData, placeholder }) {
-  const [chat, setChat] = useState([{ role: "assistant", content: "Ask me anything about your data here — I'll only use what's actually recorded." }]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function send() {
-    if (!input.trim() || busy) return;
-    const q = input.trim();
-    setChat((c) => [...c, { role: "user", content: q }]);
-    setInput("");
-    setBusy(true);
-    try {
-      const { text } = await callClaude({
-        system: systemPrompt,
-        messages: [{ role: "user", content: `Data (JSON): ${JSON.stringify(contextData)}\n\nQuestion: ${q}` }],
-        maxTokens: 500,
-      });
-      setChat((c) => [...c, { role: "assistant", content: text || "I couldn't come up with an answer." }]);
-    } catch (e) {
-      setChat((c) => [...c, { role: "assistant", content: "Something went wrong reaching the assistant. Try again." }]);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="flex flex-col" style={{ height: 480 }}>
-      <div className="rounded-lg flex-1 p-4 space-y-3 overflow-y-auto mb-3" style={{ background: "white", border: "1px solid #DAD5C8" }}>
-        {chat.map((m, i) => (
-          <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className="rounded-lg px-3 py-2 text-sm max-w-[75%]" style={{ background: m.role === "user" ? color : "#EBE8DF", color: m.role === "user" ? "white" : "#182234" }}>{m.content}</div>
-          </div>
-        ))}
-        {busy && <div className="text-xs" style={{ color: "#3C4A66" }}>Thinking…</div>}
-      </div>
-      <div className="flex gap-2">
-        <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} placeholder={placeholder}
-          className="flex-1 rounded-md px-3 py-2 text-sm outline-none" style={{ background: "white", border: "1px solid #DAD5C8" }} />
-        <button onClick={send} disabled={busy} className="px-4 rounded-md flex items-center justify-center text-white" style={{ background: color }}><Send size={14} /></button>
-      </div>
-    </div>
-  );
-}
+function SectorAssistant({profile}) {return <CoachPanel config={profile}/>;}
 
 /* ---------------------------- Business sector ---------------------------- */
 
@@ -2616,23 +2439,41 @@ function BusinessSector({ onBack }) {
   const [ready, setReady] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [transactions, setTransactions] = useState([]);
+  const [scorecards, setScorecards] = useState([]);
+  const [permissions, setPermissions] = useState(DEFAULT_PERMISSIONS);
+  const [schoolDeadlines, setSchoolDeadlines] = useState([]);
   const [tab, setTab] = useState("overview");
   const [showTaskModal, setShowTaskModal] = useState(false);
   const [showTxnModal, setShowTxnModal] = useState(false);
+  const [ideaForm, setIdeaForm] = useState({ title: "", description: "" });
+  const [analyzingIdea, setAnalyzingIdea] = useState(false);
   const loaded = useRef(false);
 
   useEffect(() => {
     (async () => {
       const data = await readSectorStorage(SECTOR_META.business.storageKey);
-      if (data) { setTasks(data.tasks || []); setTransactions(data.transactions || []); }
+      if (data) { setTasks(data.tasks || []); setTransactions(data.transactions || []); setScorecards(data.scorecards || []); }
+      const perms = await getPermissions();
+      setPermissions(perms);
+      if (perms.schoolToBusiness) {
+        const school = await readSectorStorage(SECTOR_META.school.storageKey);
+        if (school) {
+          const today = localDateString();
+          const deadlines = [
+            ...(school.assignments || []).filter((a) => a.due_date >= today && a.status !== "completed").map((a) => ({ title: a.title, date: a.due_date, kind: "assignment" })),
+            ...(school.tests || []).filter((t) => t.date >= today).map((t) => ({ title: t.title, date: t.date, kind: "test" })),
+          ].sort((a, b) => a.date.localeCompare(b.date)).slice(0, 5);
+          setSchoolDeadlines(deadlines);
+        }
+      }
       loaded.current = true;
       setReady(true);
     })();
   }, []);
   useEffect(() => {
     if (!loaded.current) return;
-    storage.set(SECTOR_META.business.storageKey, JSON.stringify({ tasks, transactions })).catch(() => {});
-  }, [tasks, transactions]);
+    storage.set(SECTOR_META.business.storageKey, JSON.stringify({ tasks, transactions, scorecards })).catch(() => {});
+  }, [tasks, transactions, scorecards]);
 
   const revenue = transactions.filter((t) => t.type === "revenue").reduce((s, t) => s + Number(t.amount || 0), 0);
   const expenses = transactions.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount || 0), 0);
@@ -2640,11 +2481,34 @@ function BusinessSector({ onBack }) {
   const activeTasks = tasks.filter((t) => t.status !== "Completed" && t.status !== "Archived");
   const upcomingDeadlines = activeTasks.filter((t) => t.deadline).sort((a, b) => a.deadline.localeCompare(b.deadline)).slice(0, 5);
 
+  async function analyzeIdea() {
+    if (!ideaForm.title.trim() && !ideaForm.description.trim()) return;
+    setAnalyzingIdea(true);
+    try {
+      const { text } = await callClaude({
+        system: AI_PROFILES.business.system,
+        messages: [{
+          role: "user",
+          content: `Analyze this business idea like a real venture, not a school project. Idea: "${ideaForm.title}". Description: ${ideaForm.description || "none given"}. ` +
+            "Walk through: problem, customer, market, competition, value proposition, business model, revenue, costs, margins, scalability, risks, competitive advantage, customer acquisition, operations, legal/regulatory considerations, execution difficulty. " +
+            "Clearly flag what's an IDEA vs an ASSUMPTION vs EVIDENCE vs a RISK vs a FACT vs an UNKNOWN. Do not simply validate the idea — find real weaknesses and propose ways to test the riskiest assumptions. End with one concrete next challenge.",
+        }],
+        maxTokens: 900,
+      });
+      setScorecards((prev) => [{ id: uid("sc"), title: ideaForm.title, description: ideaForm.description, analysis: text, created_at: new Date().toISOString() }, ...prev]);
+      setIdeaForm({ title: "", description: "" });
+    } catch (e) {
+      setScorecards((prev) => [{ id: uid("sc"), title: ideaForm.title, description: ideaForm.description, analysis: "Business Boss couldn't analyze this right now — try again.", created_at: new Date().toISOString() }, ...prev]);
+    } finally {
+      setAnalyzingIdea(false);
+    }
+  }
+
   if (!ready) return <div className="flex items-center justify-center min-h-[400px]"><Loader2 className="animate-spin" /></div>;
 
   return (
-    <SectorShell title="Business" color={SECTOR_META.business.color} icon={Briefcase} onBack={onBack}
-      tabs={[{ id: "overview", label: "Overview" }, { id: "tasks", label: "Tasks" }, { id: "finance", label: "Finance" }, { id: "assistant", label: "AI Assistant" }]}
+    <SectorShell title="Business" color={SECTOR_META.business.color} icon={Briefcase} onBack={onBack} right={<SyncButton scope="business"/>}
+      tabs={[{ id: "overview", label: "Overview" }, { id: "tasks", label: "Tasks" }, { id: "finance", label: "Finance" }, { id: "scorecard", label: "Idea Scorecard" }, { id: "assistant", label: "Business Boss" }]}
       activeTab={tab} setActiveTab={setTab}
     >
       {tab === "overview" && (
@@ -2655,7 +2519,7 @@ function BusinessSector({ onBack }) {
             <BizCard label="Profit" value={`$${profit.toLocaleString()}`} color={profit >= 0 ? "#22C55E" : "#EF4444"} />
             <BizCard label="Active tasks" value={activeTasks.length} color={SECTOR_META.business.color} />
           </div>
-          <div className="grid grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
             <div>
               <h3 className="tusk-serif font-semibold mb-2">Upcoming deadlines</h3>
               <div className="space-y-2">
@@ -2681,6 +2545,16 @@ function BusinessSector({ onBack }) {
               </div>
             </div>
           </div>
+          {permissions.schoolToBusiness && schoolDeadlines.length > 0 && (
+            <div className="mt-6">
+              <h3 className="tusk-serif font-semibold mb-2 flex items-center gap-2"><GraduationCap size={14} color={SECTOR_META.school.color} /> From School (shared)</h3>
+              <div className="space-y-1">
+                {schoolDeadlines.map((d, i) => (
+                  <div key={i} className="text-xs rounded-md p-2" style={{ background: "white", border: "1px solid #DAD5C8" }}>{d.kind === "test" ? "Test" : "Assignment"}: {d.title} — {d.date}</div>
+                ))}
+              </div>
+            </div>
+          )}
           <p className="text-xs mt-6" style={{ color: "#3C4A66" }}>Marketing and Product modules are scaffolded for a future pass — ask if you'd like either built out.</p>
         </div>
       )}
@@ -2735,10 +2609,33 @@ function BusinessSector({ onBack }) {
         </div>
       )}
 
+      {tab === "scorecard" && (
+        <div>
+          <h2 className="tusk-serif text-lg font-semibold mb-1 flex items-center gap-2"><Award size={16} color={SECTOR_META.business.color} /> Idea Scorecard</h2>
+          <p className="text-xs mb-4" style={{ color: "#3C4A66" }}>Business Boss will stress-test the idea rather than just approve it.</p>
+          <div className="rounded-lg p-4 mb-4" style={{ background: "white", border: "1px solid #DAD5C8" }}>
+            <input value={ideaForm.title} onChange={(e) => setIdeaForm({ ...ideaForm, title: e.target.value })} placeholder="Idea name" className="w-full mb-2 px-3 py-2 rounded-md text-sm" style={{ border: "1px solid #DAD5C8" }} />
+            <textarea value={ideaForm.description} onChange={(e) => setIdeaForm({ ...ideaForm, description: e.target.value })} placeholder="Describe the idea..." rows={3} className="w-full mb-2 px-3 py-2 rounded-md text-sm" style={{ border: "1px solid #DAD5C8" }} />
+            <button onClick={analyzeIdea} disabled={analyzingIdea} className="text-xs px-3 py-2 rounded-md font-medium text-white flex items-center gap-2" style={{ background: SECTOR_META.business.color }}>
+              {analyzingIdea ? <Loader2 size={12} className="animate-spin" /> : <Award size={12} />} {analyzingIdea ? "Business Boss is thinking..." : "Get Business Boss's take"}
+            </button>
+          </div>
+          <div className="space-y-3">
+            {scorecards.map((s) => (
+              <div key={s.id} className="rounded-lg p-4" style={{ background: "white", border: "1px solid #DAD5C8" }}>
+                <div className="text-sm font-medium mb-1">{s.title}</div>
+                <div className="text-xs whitespace-pre-wrap" style={{ color: "#182234" }}>{s.analysis}</div>
+              </div>
+            ))}
+            {scorecards.length === 0 && <p className="text-sm" style={{ color: "#3C4A66" }}>No ideas scored yet.</p>}
+          </div>
+        </div>
+      )}
+
       {tab === "assistant" && (
-        <SectorAssistant color={SECTOR_META.business.color} placeholder="What are my current expenses?"
-          systemPrompt="You are the Tusk Business assistant. Only use the tasks and transactions JSON provided — never invent financial figures or business data. If asked for a decision, explain the data and trends but don't tell the user what to decide."
-          contextData={{ tasks, transactions, revenue, expenses, profit }}
+        <SectorAssistant profile={AI_PROFILES.business} placeholder="What are my current expenses?"
+          contextData={{ tasks, transactions, revenue, expenses, profit, school_deadlines_shared: permissions.schoolToBusiness ? schoolDeadlines : "not shared" }}
+          crossSectorNote={permissions.schoolToBusiness ? "School deadlines are shared with Business Boss." : "School data isn't shared with Business — enable it in Health & Wellness → Privacy & Permissions if you want it."}
         />
       )}
 
@@ -2759,9 +2656,10 @@ function BizCard({ label, value, color }) {
 
 function BizTaskModal({ onClose, onSave }) {
   const [form, setForm] = useState({ title: "", description: "", category: "", priority: "medium", deadline: "", estimated_time: "", notes: "", related_project: "" });
+  useEscapeToClose(onClose);
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div className="rounded-lg p-6 w-full max-w-md" style={{ background: "#F4F2EC" }}>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div className="rounded-lg p-6 w-full max-w-md max-h-[85vh] overflow-y-auto" style={{ background: "#F4F2EC" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4"><h2 className="tusk-serif text-lg font-semibold">Add business task</h2><button onClick={onClose}><X size={16} /></button></div>
         <div className="space-y-3">
           {["title", "description", "category", "related_project", "notes"].map((f) => (
@@ -2791,9 +2689,10 @@ function BizTaskModal({ onClose, onSave }) {
 
 function BizTxnModal({ onClose, onSave }) {
   const [form, setForm] = useState({ type: "revenue", amount: "", category: "", date: localDateString(), notes: "" });
+  useEscapeToClose(onClose);
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div className="rounded-lg p-6 w-full max-w-md" style={{ background: "#F4F2EC" }}>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div className="rounded-lg p-6 w-full max-w-md max-h-[85vh] overflow-y-auto" style={{ background: "#F4F2EC" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4"><h2 className="tusk-serif text-lg font-semibold">Add transaction</h2><button onClick={onClose}><X size={16} /></button></div>
         <div className="space-y-3">
           <div className="flex gap-2">
@@ -2826,26 +2725,50 @@ function BizTxnModal({ onClose, onSave }) {
 
 function SportsSector({ onBack }) {
   const [ready, setReady] = useState(false);
-  const [sports, setSports] = useState(["Running"]);
+  const [sports, setSports] = useState(["Soccer", "Running"]);
   const [sessions, setSessions] = useState([]);
   const [goals, setGoals] = useState([]);
+  const [briefs, setBriefs] = useState([]);
+  const [permissions, setPermissions] = useState(DEFAULT_PERMISSIONS);
+  const [schoolDeadlines, setSchoolDeadlines] = useState([]);
+  const [healthLatest, setHealthLatest] = useState(null);
   const [tab, setTab] = useState("overview");
   const [showSessionModal, setShowSessionModal] = useState(false);
   const [showGoalModal, setShowGoalModal] = useState(false);
+  const [generatingBrief, setGeneratingBrief] = useState(null); // "daily" | "weekly" | null
   const loaded = useRef(false);
 
   useEffect(() => {
     (async () => {
       const data = await readSectorStorage(SECTOR_META.sports.storageKey);
-      if (data) { setSports(data.sports || ["Running"]); setSessions(data.sessions || []); setGoals(data.goals || []); }
+      if (data) { setSports(data.sports || ["Running"]); setSessions(data.sessions || []); setGoals(data.goals || []); setBriefs(data.briefs || []); }
+      const perms = await getPermissions();
+      setPermissions(perms);
+      if (perms.schoolToSports) {
+        const school = await readSectorStorage(SECTOR_META.school.storageKey);
+        if (school) {
+          const today = localDateString();
+          const deadlines = [
+            ...(school.assignments || []).filter((a) => a.due_date >= today && a.status !== "completed").map((a) => ({ title: a.title, date: a.due_date, kind: "assignment" })),
+            ...(school.tests || []).filter((t) => t.date >= today).map((t) => ({ title: t.title, date: t.date, kind: "test" })),
+          ].sort((a, b) => a.date.localeCompare(b.date)).slice(0, 5);
+          setSchoolDeadlines(deadlines);
+        }
+      }
+      if (perms.sportsToHealth) {
+        const health = await readSectorStorage(SECTOR_META.health.storageKey);
+        if (health && health.reports && health.reports.length) {
+          setHealthLatest([...health.reports].sort((a, b) => (b.date_range_end || "").localeCompare(a.date_range_end || ""))[0]);
+        }
+      }
       loaded.current = true;
       setReady(true);
     })();
   }, []);
   useEffect(() => {
     if (!loaded.current) return;
-    storage.set(SECTOR_META.sports.storageKey, JSON.stringify({ sports, sessions, goals })).catch(() => {});
-  }, [sports, sessions, goals]);
+    storage.set(SECTOR_META.sports.storageKey, JSON.stringify({ sports, sessions, goals, briefs })).catch(() => {});
+  }, [sports, sessions, goals, briefs]);
 
   const todayStr = localDateString();
   const todaySessions = sessions.filter((s) => s.date === todayStr);
@@ -2854,13 +2777,33 @@ function SportsSector({ onBack }) {
   const weekAgoDate = new Date();
   weekAgoDate.setDate(weekAgoDate.getDate() - 7);
   const weekAgo = localDateString(weekAgoDate);
-  const weekVolume = sessions.filter((s) => s.date >= weekAgo && s.date <= todayStr).reduce((sum, s) => sum + Number(s.duration || 0), 0);
+  const weekSessions = sessions.filter((s) => s.date >= weekAgo && s.date <= todayStr);
+  const weekVolume = weekSessions.reduce((sum, s) => sum + Number(s.duration || 0), 0);
+
+  async function generateBrief(kind) {
+    setGeneratingBrief(kind);
+    try {
+      const dataForBrief = kind === "daily"
+        ? { today_sessions: todaySessions, upcoming: upcoming.slice(0, 3), recent: recent.slice(0, 3), goals, health: healthLatest, school_deadlines: schoolDeadlines }
+        : { week_sessions: weekSessions, week_volume: weekVolume, goals, health: healthLatest, school_deadlines: schoolDeadlines };
+      const prompt = kind === "daily"
+        ? "Produce a DAILY PERFORMANCE BRIEF from this data: sleep/recovery (if available), recent training, upcoming competition, recent performance, one key trend, the main area to improve, and a suggested focus for today. Keep it tight and concrete."
+        : "Produce a WEEKLY PERFORMANCE REVIEW from this data: training volume, performance trends, recovery/sleep trends (if available), goal progress, areas of improvement, and areas requiring attention. Keep it tight and concrete.";
+      const result = await runCoach({config:AI_PROFILES.sports,question:prompt,history:[]});
+      const text = "DEMO COACH · " + result.text;
+      setBriefs((prev) => [{ id: uid("brief"), kind, content: text, created_at: new Date().toISOString() }, ...prev].slice(0, 10));
+    } catch (e) {
+      setBriefs((prev) => [{ id: uid("brief"), kind, content: "Elite Coach couldn't generate this right now — try again.", created_at: new Date().toISOString() }, ...prev].slice(0, 10));
+    } finally {
+      setGeneratingBrief(null);
+    }
+  }
 
   if (!ready) return <div className="flex items-center justify-center min-h-[400px]"><Loader2 className="animate-spin" /></div>;
 
   return (
-    <SectorShell title="Sports" color={SECTOR_META.sports.color} icon={Activity} onBack={onBack}
-      tabs={[{ id: "overview", label: "Overview" }, { id: "training", label: "Training" }, { id: "goals", label: "Goals" }, { id: "assistant", label: "AI Assistant" }]}
+    <SectorShell title="Sports" color={SECTOR_META.sports.color} icon={Activity} onBack={onBack} right={<SyncButton scope="sports"/>}
+      tabs={[{ id: "overview", label: "Overview" }, { id: "training", label: "Training" }, { id: "goals", label: "Goals" }, { id: "briefs", label: "Performance Briefs" }, { id: "assistant", label: "Elite Coach" }]}
       activeTab={tab} setActiveTab={setTab}
     >
       {tab === "overview" && (
@@ -2875,7 +2818,7 @@ function SportsSector({ onBack }) {
             {sports.map((s) => <span key={s} className="text-xs px-3 py-1 rounded-full" style={{ background: "white", border: "1px solid #DAD5C8" }}>{s}</span>)}
             <button onClick={() => { const s = prompt("Add a sport (e.g. Swimming)"); if (s) setSports((prev) => [...prev, s]); }} className="text-xs px-3 py-1 rounded-full border flex items-center gap-1" style={{ borderColor: "#DAD5C8" }}><Plus size={11} /> Add sport</button>
           </div>
-          <div className="grid grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
             <div>
               <h3 className="tusk-serif font-semibold mb-2">Recent sessions</h3>
               <div className="space-y-2">
@@ -2904,6 +2847,22 @@ function SportsSector({ onBack }) {
               </div>
             </div>
           </div>
+          {permissions.schoolToSports && schoolDeadlines.length > 0 && (
+            <div className="mt-6">
+              <h3 className="tusk-serif font-semibold mb-2 flex items-center gap-2"><GraduationCap size={14} color={SECTOR_META.school.color} /> From School (shared)</h3>
+              <div className="space-y-1">
+                {schoolDeadlines.map((d, i) => <div key={i} className="text-xs rounded-md p-2" style={{ background: "white", border: "1px solid #DAD5C8" }}>{d.kind === "test" ? "Test" : "Assignment"}: {d.title} — {d.date}</div>)}
+              </div>
+            </div>
+          )}
+          {permissions.sportsToHealth && healthLatest && (
+            <div className="mt-4">
+              <h3 className="tusk-serif font-semibold mb-2 flex items-center gap-2"><HeartPulse size={14} color={SECTOR_META.health.color} /> From Health (shared)</h3>
+              <div className="text-xs rounded-md p-2" style={{ background: "white", border: "1px solid #DAD5C8" }}>
+                {healthLatest.sleep_minutes ? `Sleep: ${Math.floor(healthLatest.sleep_minutes / 60)}h${healthLatest.sleep_minutes % 60}m` : ""}{healthLatest.activity_minutes ? ` · Activity: ${healthLatest.activity_minutes}min` : ""}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -2953,10 +2912,35 @@ function SportsSector({ onBack }) {
         </div>
       )}
 
+      {tab === "briefs" && (
+        <div>
+          <div className="flex items-center gap-2 mb-4 flex-wrap">
+            <button onClick={() => generateBrief("daily")} disabled={!!generatingBrief} className="flex items-center gap-2 text-xs px-3 py-2 rounded-md font-medium text-white" style={{ background: SECTOR_META.sports.color }}>
+              {generatingBrief === "daily" ? <Loader2 size={12} className="animate-spin" /> : <Trophy size={12} />} Daily Performance Brief
+            </button>
+            <button onClick={() => generateBrief("weekly")} disabled={!!generatingBrief} className="flex items-center gap-2 text-xs px-3 py-2 rounded-md font-medium border" style={{ borderColor: SECTOR_META.sports.color, color: SECTOR_META.sports.color }}>
+              {generatingBrief === "weekly" ? <Loader2 size={12} className="animate-spin" /> : <TrendingUp size={12} />} Weekly Performance Review
+            </button>
+          </div>
+          <div className="space-y-3">
+            {briefs.map((b) => (
+              <div key={b.id} className="rounded-lg p-4" style={{ background: "white", border: "1px solid #DAD5C8" }}>
+                <div className="text-xs font-semibold mb-1 uppercase tracking-wide" style={{ color: SECTOR_META.sports.color }}>{b.kind === "daily" ? "Daily Performance Brief" : "Weekly Performance Review"} · {new Date(b.created_at).toLocaleDateString()}</div>
+                <div className="text-xs whitespace-pre-wrap">{b.content}</div>
+              </div>
+            ))}
+            {briefs.length === 0 && <p className="text-sm" style={{ color: "#3C4A66" }}>No briefs generated yet.</p>}
+          </div>
+        </div>
+      )}
+
       {tab === "assistant" && (
-        <SectorAssistant color={SECTOR_META.sports.color} placeholder="How much have I trained this week?"
-          systemPrompt="You are the Tusk Sports assistant. Only use the training sessions and goals JSON provided — never invent performance results or metrics that aren't recorded."
-          contextData={{ sessions, goals, sports }}
+        <SectorAssistant profile={AI_PROFILES.sports} placeholder="How much have I trained this week?"
+          contextData={{ sessions, goals, sports, school_deadlines_shared: permissions.schoolToSports ? schoolDeadlines : "not shared", health_shared: permissions.sportsToHealth ? healthLatest : "not shared" }}
+          crossSectorNote={[
+            permissions.schoolToSports ? "School deadlines shared." : null,
+            permissions.sportsToHealth ? "Health data shared." : "Health data not shared — enable in Health & Wellness → Privacy & Permissions for sleep/recovery-aware coaching.",
+          ].filter(Boolean).join(" ")}
         />
       )}
 
@@ -2968,9 +2952,10 @@ function SportsSector({ onBack }) {
 
 function SportsSessionModal({ sports, onClose, onSave }) {
   const [form, setForm] = useState({ sport: sports[0] || "", date: localDateString(), duration: "", type: "", distance: "", intensity: "medium", notes: "" });
+  useEscapeToClose(onClose);
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div className="rounded-lg p-6 w-full max-w-md" style={{ background: "#F4F2EC" }}>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div className="rounded-lg p-6 w-full max-w-md max-h-[85vh] overflow-y-auto" style={{ background: "#F4F2EC" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4"><h2 className="tusk-serif text-lg font-semibold">Log training session</h2><button onClick={onClose}><X size={16} /></button></div>
         <div className="space-y-3">
           <label className="block text-xs" style={{ color: "#3C4A66" }}>Sport
@@ -3007,9 +2992,10 @@ function SportsSessionModal({ sports, onClose, onSave }) {
 
 function SportsGoalModal({ sports, onClose, onSave }) {
   const [form, setForm] = useState({ name: "", sport: sports[0] || "", target: "", current: "", deadline: "", notes: "" });
+  useEscapeToClose(onClose);
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: "rgba(24,34,52,0.4)" }}>
-      <div className="rounded-lg p-6 w-full max-w-md" style={{ background: "#F4F2EC" }}>
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(24,34,52,0.4)" }} onClick={onClose}>
+      <div className="rounded-lg p-6 w-full max-w-md max-h-[85vh] overflow-y-auto" style={{ background: "#F4F2EC" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4"><h2 className="tusk-serif text-lg font-semibold">Add sports goal</h2><button onClick={onClose}><X size={16} /></button></div>
         <div className="space-y-3">
           <label className="block text-xs" style={{ color: "#3C4A66" }}>Goal name
@@ -3046,7 +3032,7 @@ function SportsGoalModal({ sports, onClose, onSave }) {
 function HealthSector({ onBack }) {
   const [ready, setReady] = useState(false);
   const [reports, setReports] = useState([]);
-  const [sharing, setSharing] = useState({ school: false, business: false, sports: false });
+  const [permissions, setPermissions] = useState(DEFAULT_PERMISSIONS);
   const [tab, setTab] = useState("overview");
   const [syncing, setSyncing] = useState(false);
   const [syncErrorInfo, setSyncErrorInfo] = useState(null);
@@ -3056,15 +3042,22 @@ function HealthSector({ onBack }) {
   useEffect(() => {
     (async () => {
       const data = await readSectorStorage(SECTOR_META.health.storageKey);
-      if (data) { setReports(data.reports || []); setSharing(data.sharing || { school: false, business: false, sports: false }); }
+      if (data) setReports(data.reports || []);
+      const perms = await getPermissions();
+      setPermissions(perms);
       loaded.current = true;
       setReady(true);
     })();
   }, []);
   useEffect(() => {
     if (!loaded.current) return;
-    storage.set(SECTOR_META.health.storageKey, JSON.stringify({ reports, sharing })).catch(() => {});
-  }, [reports, sharing]);
+    storage.set(SECTOR_META.health.storageKey, JSON.stringify({ reports })).catch(() => {});
+  }, [reports]);
+
+  async function togglePermission(key) {
+    const next = await setPermission(key, !permissions[key]);
+    setPermissions(next);
+  }
 
   const latest = [...reports].sort((a, b) => (b.date_range_end || "").localeCompare(a.date_range_end || ""))[0] || null;
 
@@ -3113,9 +3106,9 @@ function HealthSector({ onBack }) {
 
   return (
     <SectorShell title="Health & Wellness" color={SECTOR_META.health.color} icon={HeartPulse} onBack={onBack}
-      tabs={[{ id: "overview", label: "Overview" }, { id: "reports", label: "Reports" }, { id: "privacy", label: "Data & Privacy" }, { id: "assistant", label: "AI Assistant" }]}
+      tabs={[{ id: "overview", label: "Overview" }, { id: "reports", label: "Reports" }, { id: "privacy", label: "Privacy & Permissions" }, { id: "assistant", label: "Wellness Coach" }]}
       activeTab={tab} setActiveTab={setTab}
-      right={<button onClick={syncHealthData} disabled={syncing} className="flex items-center gap-2 text-xs px-3 py-2 rounded-full font-medium" style={{ background: "rgba(255,255,255,0.15)", color: "white" }}><RefreshCw size={13} className={syncing ? "animate-spin" : ""} /> {syncing ? "Syncing health data..." : "Sync Health Data"}</button>}
+      right={<SyncButton scope="health"/>}
     >
       {syncErrorInfo && (
         <div className="mb-4 rounded-md p-3 text-xs" style={{ background: "#FDECEC", border: "1px solid #F5C6C6" }}>
@@ -3134,7 +3127,7 @@ function HealthSector({ onBack }) {
               <BizCard label="Activity" value={latest.activity_minutes ? `${latest.activity_minutes} min` : "No data"} color={SECTOR_META.health.color} />
             </div>
           ) : (
-            <p className="text-sm mt-2" style={{ color: "#3C4A66" }}>No health reports found yet — hit "Sync Health Data" once you have wellness emails to pull from.</p>
+            <p className="text-sm mt-2" style={{ color: "#3C4A66" }}>No health reports imported. Open Sync Health to check Gmail connection setup.</p>
           )}
           <p className="text-xs mt-4" style={{ color: "#3C4A66" }}>Only numbers actually found in your emails are shown here — nothing is estimated or inferred as fact.</p>
         </div>
@@ -3157,24 +3150,32 @@ function HealthSector({ onBack }) {
 
       {tab === "privacy" && (
         <div className="max-w-md">
-          <h2 className="tusk-serif text-lg font-semibold mb-3 flex items-center gap-2"><ShieldCheck size={16} /> Data sources & privacy</h2>
-          <p className="text-xs mb-4" style={{ color: "#3C4A66" }}>Health data is private by default. Nothing here is shared with other sectors unless you turn it on below.</p>
+          <h2 className="tusk-serif text-lg font-semibold mb-3 flex items-center gap-2"><ShieldCheck size={16} /> Privacy & Permissions</h2>
+          <p className="text-xs mb-4" style={{ color: "#3C4A66" }}>This is the one shared control panel for cross-sector data access — used by every sector's AI, not just Health. Health data is private by default.</p>
+
+          <div className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#3C4A66" }}>Health sharing out</div>
+          <div className="space-y-2 mb-5">
+            <PermissionRow label="Share with School" value={permissions.healthToSchool} onToggle={() => togglePermission("healthToSchool")} color={SECTOR_META.health.color} />
+            <PermissionRow label="Share with Business" value={permissions.healthToBusiness} onToggle={() => togglePermission("healthToBusiness")} color={SECTOR_META.health.color} />
+            <PermissionRow label="Share with Sports" value={permissions.healthToSports} onToggle={() => togglePermission("healthToSports")} color={SECTOR_META.health.color} description="Also controlled below by Sports → Health, since Elite Coach needs both directions to reason about sleep and recovery." />
+          </div>
+
+          <div className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#3C4A66" }}>Other sectors requesting Health data</div>
+          <div className="space-y-2 mb-5">
+            <PermissionRow label="Sports → Health" description="Lets Elite Coach factor in sleep/recovery. Requires authorization — off by default." value={permissions.sportsToHealth} onToggle={() => togglePermission("sportsToHealth")} color={SECTOR_META.health.color} />
+            <PermissionRow label="Business → Health" value={permissions.businessToHealth} onToggle={() => togglePermission("businessToHealth")} color={SECTOR_META.health.color} />
+          </div>
+
+          <div className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#3C4A66" }}>School sharing out (used by Business Boss / Elite Coach)</div>
           <div className="space-y-2">
-            {["school", "business", "sports"].map((sec) => (
-              <div key={sec} className="rounded-md p-3 flex items-center justify-between" style={{ background: "white", border: "1px solid #DAD5C8" }}>
-                <span className="text-sm capitalize">Share with {sec}</span>
-                <button onClick={() => setSharing((prev) => ({ ...prev, [sec]: !prev[sec] }))} className="text-xs px-3 py-1 rounded-full font-medium" style={{ background: sharing[sec] ? SECTOR_META.health.color : "#EBE8DF", color: sharing[sec] ? "white" : "#3C4A66" }}>
-                  {sharing[sec] ? "Enabled" : "Disabled"}
-                </button>
-              </div>
-            ))}
+            <PermissionRow label="School → Business" value={permissions.schoolToBusiness} onToggle={() => togglePermission("schoolToBusiness")} color={SECTOR_META.school.color} />
+            <PermissionRow label="School → Sports" value={permissions.schoolToSports} onToggle={() => togglePermission("schoolToSports")} color={SECTOR_META.school.color} />
           </div>
         </div>
       )}
 
       {tab === "assistant" && (
-        <SectorAssistant color={SECTOR_META.health.color} placeholder="Summarize my health report"
-          systemPrompt="You are the Tusk Health assistant. Only use the wellness reports JSON provided. Never diagnose medical conditions or present interpretation as medical fact — clearly separate recorded data from any observations you make."
+        <SectorAssistant profile={AI_PROFILES.health} placeholder="Summarize my health report"
           contextData={{ reports }}
         />
       )}
@@ -3184,77 +3185,52 @@ function HealthSector({ onBack }) {
 
 /* ---------------------------- Global AI Assistant ---------------------------- */
 
-function GlobalAssistant({ onBack }) {
-  const [chat, setChat] = useState([{ role: "assistant", content: "I'm the Tusk assistant — I can pull together what's going on across School, Business, Sports, and (if you've shared it) Health. What do you want to know?" }]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function send() {
-    if (!input.trim() || busy) return;
-    const q = input.trim();
-    setChat((c) => [...c, { role: "user", content: q }]);
-    setInput("");
-    setBusy(true);
-    try {
-      const [school, business, sports, health] = await Promise.all([
-        readSectorStorage(SECTOR_META.school.storageKey),
-        readSectorStorage(SECTOR_META.business.storageKey),
-        readSectorStorage(SECTOR_META.sports.storageKey),
-        readSectorStorage(SECTOR_META.health.storageKey),
-      ]);
-      const context = {
-        school: school ? { assignments: (school.assignments || []).map((a) => ({ title: a.title, subject: a.subject, due_date: a.due_date, status: a.status })), tests: (school.tests || []).map((t) => ({ title: t.title, subject: t.subject, date: t.date })) } : null,
-        business: business ? { tasks: (business.tasks || []).map((t) => ({ title: t.title, status: t.status, deadline: t.deadline })) } : null,
-        sports: sports ? { upcoming_sessions: (sports.sessions || []).filter((s) => s.date >= localDateString()) } : null,
-        health: health && health.sharing && Object.values(health.sharing).some(Boolean) ? { reports: health.reports || [] } : { note: "Health data not shared — respect this and don't ask the user to share it repeatedly." },
-      };
-      const { text } = await callClaude({
-        system:
-          "You are the Tusk global assistant with visibility across the School, Business, Sports, and (only if shared) Health sectors. " +
-          "Only use the JSON data given — never invent tasks, deadlines, or events. When you combine info from multiple sectors, label each part with the sector name (SCHOOL / BUSINESS / SPORTS / HEALTH) so the source is clear. " +
-          "If a sector's data is missing or null, say you don't have access to it rather than guessing.",
-        messages: [{ role: "user", content: `Today's date: ${new Date().toDateString()}. Data: ${JSON.stringify(context)}\n\nQuestion: ${q}` }],
-        maxTokens: 600,
-      });
-      setChat((c) => [...c, { role: "assistant", content: text || "I couldn't come up with an answer." }]);
-    } catch (e) {
-      setChat((c) => [...c, { role: "assistant", content: "Something went wrong pulling your data together. Try again." }]);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <SectorShell title="AI Personal Assistant" color="#1E293B" icon={Sparkles} onBack={onBack}>
-      <div className="flex flex-col" style={{ height: 520 }}>
-        <div className="rounded-lg flex-1 p-4 space-y-3 overflow-y-auto mb-3" style={{ background: "white", border: "1px solid #DAD5C8" }}>
-          {chat.map((m, i) => (
-            <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className="rounded-lg px-3 py-2 text-sm max-w-[75%] whitespace-pre-wrap" style={{ background: m.role === "user" ? "#1E293B" : "#EBE8DF", color: m.role === "user" ? "white" : "#182234" }}>{m.content}</div>
-            </div>
-          ))}
-          {busy && <div className="text-xs" style={{ color: "#3C4A66" }}>Pulling your data together…</div>}
-        </div>
-        <div className="flex gap-2">
-          <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} placeholder="What do I have going on this week?"
-            className="flex-1 rounded-md px-3 py-2 text-sm outline-none" style={{ background: "white", border: "1px solid #DAD5C8" }} />
-          <button onClick={send} disabled={busy} className="px-4 rounded-md flex items-center justify-center text-white" style={{ background: "#1E293B" }}><Send size={14} /></button>
-        </div>
-      </div>
-    </SectorShell>
-  );
-}
+function GlobalAssistant({onBack}) {return <SectorShell title="AI Personal Assistant" color="#1E293B" icon={Sparkles} onBack={onBack}><CoachPanel config={AI_PROFILES.global}/></SectorShell>;}
 
 /* ---------------------------- Top-level app ---------------------------- */
 
-export default function TuskApp() {
-  const [sector, setSector] = useState("home");
+function TuskApp() {
+  const [sector, setSector] = useState("today");
 
-  if (sector === "home") return <TuskHome onNavigate={setSector} />;
-  if (sector === "school") return <SchoolSector onBack={() => setSector("home")} />;
-  if (sector === "business") return <BusinessSector onBack={() => setSector("home")} />;
-  if (sector === "sports") return <SportsSector onBack={() => setSector("home")} />;
-  if (sector === "health") return <HealthSector onBack={() => setSector("home")} />;
-  if (sector === "assistant") return <GlobalAssistant onBack={() => setSector("home")} />;
-  return <TuskHome onNavigate={setSector} />;
+  useEffect(() => {
+    const context = document.modelContext;
+    if (!context?.registerTool) return;
+    const lifecycle = new AbortController();
+    Promise.resolve(context.registerTool({
+      name: "navigate_tusk_sector", title: "Open Tusk section",
+      description: "Navigate to a section of the Tusk planner.",
+      inputSchema: {type:"object",properties:{sector:{type:"string",enum:["today","week","ib","soccer","experiments","reflection","memory","home","school","business","sports","health","assistant"]}},required:["sector"],additionalProperties:false},
+      annotations: {readOnlyHint:false},
+      async execute(input) {
+        if (!input || !["today","week","ib","soccer","experiments","reflection","memory","home","school","business","sports","health","assistant"].includes(input.sector)) throw new Error("Unknown section");
+        setSector(input.sector);
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return {section:input.sector};
+      }
+    }, {signal:lifecycle.signal})).catch(() => {});
+    return () => lifecycle.abort();
+  }, []);
+  const navigate = value => {setSector(value);window.scrollTo({top:0,behavior:'instant'});};
+  let page;
+  if(LIFE_VIEWS.includes(sector)) page=<LifeWorkspace view={sector} navigate={navigate}/>;
+  else if(sector==='school')page=<SchoolSector onBack={()=>navigate('home')}/>;
+  else if(sector==='business')page=<BusinessSector onBack={()=>navigate('home')}/>;
+  else if(sector==='sports')page=<SportsSector onBack={()=>navigate('home')}/>;
+  else if(sector==='health')page=<HealthSector onBack={()=>navigate('home')}/>;
+  else if(sector==='assistant')page=<GlobalAssistant onBack={()=>navigate('home')}/>;
+  else page=<TuskHome onNavigate={navigate}/>;
+  return <><LifeNav view={sector} navigate={navigate}/>{page}</>;
+
+}
+export default function TuskRuntime() {
+  const [ready,setReady]=useState(false);
+  const [workspaceKey,setWorkspaceKey]=useState(0);
+  const [loadError,setLoadError]=useState("");
+  const [notice,setNotice]=useState("");
+  const [saveError,setSaveError]=useState("");
+  async function load() {setLoadError("");try {await initializeStorage();setReady(true);} catch {setLoadError("Your saved data could not be loaded. Try again before making changes.");}}
+  useEffect(()=>{load();const onNotice=e=>setNotice(e.detail);const onSave=e=>setSaveError(e.detail);window.addEventListener("tusk-notice",onNotice);window.addEventListener("tusk-save-error",onSave);return()=>{window.removeEventListener("tusk-notice",onNotice);window.removeEventListener("tusk-save-error",onSave);};},[]);
+  useEffect(()=>{const refresh=()=>setWorkspaceKey(k=>k+1);window.addEventListener("tusk-sync-imported",refresh);return()=>window.removeEventListener("tusk-sync-imported",refresh);},[]);
+  if(!ready)return <main className="min-h-screen flex flex-col items-center justify-center gap-4 bg-[#05070C] text-white"><h1 className="text-3xl tusk-serif">Tusk</h1><p role="status">{loadError || "Opening your planner…"}</p>{loadError&&<><button className="rounded border px-5 py-2" onClick={load}>Try again</button><button className="rounded border px-5 py-2" onClick={()=>{startDemo(DEMO_RECORDS);setReady(true);}}>Explore sample workspace</button><a href="/signin-with-chatgpt?return_to=%2F" target="_top">Sign in again</a></>}</main>;
+  return <><div className="connection-note">ChatGPT coaches · Sync through your connected ChatGPT plugins · Google Health is not connected. {!isDemo()&&<button className="underline ml-3" onClick={()=>{try{startDemo(DEMO_RECORDS);setWorkspaceKey(k=>k+1);}catch(e){setNotice(e.message);}}}>Explore sample workspace</button>}</div>{saveError&&<div role="alert" className="save-notice">{saveError} <button onClick={retrySaves}>Retry saving</button></div>}{notice&&<div role="status" className="save-notice">{notice} <button onClick={()=>setNotice("")}>Dismiss</button></div>}{isDemo()&&<div className="save-notice">Sample workspace · All records are fictional. Changes last only in this tab. <button onClick={()=>location.reload()}>Return to saved workspace</button></div>}<TuskApp key={workspaceKey}/><SyncCenter/></>;
 }

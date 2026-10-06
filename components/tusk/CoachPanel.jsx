@@ -1,0 +1,16 @@
+'use client';
+import {Memory} from '../life/Memory';
+import {useEffect,useState} from 'react';
+import {loadPermissions,savePermission} from '../../lib/ai/framework';
+import {SECTORS,canRead,permissionKey} from '../../lib/ai/permissions';
+import {coachPrompt} from '../../lib/chatgpt/model';
+import {Handoff} from '../chatgpt/Handoff';
+import {VoiceInput} from '../chatgpt/VoiceInput';
+import {isDemo,flushSaves} from '../../app/storage';
+export function CoachPanel({config}){
+ const [input,setInput]=useState(''),[request,setRequest]=useState(''),[permissions,setPermissions]=useState({}),[error,setError]=useState('');
+ useEffect(()=>{const update=()=>{setRequest('');loadPermissions().then(setPermissions).catch(()=>setError('Could not load permissions.'));};update();window.addEventListener('tusk-permissions-changed',update);return()=>window.removeEventListener('tusk-permissions-changed',update);},[config.id]);
+ async function toggle(source){try{const value=!canRead(source,config.id,permissions);await savePermission(permissionKey(source,config.id),value);if(source==='health'&&config.id==='sports')await savePermission('sportsToHealth',value);await flushSaves();}catch(e){setError(e.message);}}
+ async function prepare(e){e.preventDefault();setError('');try{if(isDemo())throw new Error('Return to your saved workspace to use your real Tusk context in ChatGPT.');await flushSaves();setRequest(coachPrompt(config,input));}catch(e){setError(e.message);}}
+ return <section className="coach-panel" style={{'--coach-color':config.color}}><header><span className="coach-badge">CONTINUE WITH CHATGPT</span><h2>{config.name}</h2><p>{config.tagline}</p><p className="coach-personality">{config.personality}</p></header><p className="coach-disclosure">Ask here by voice or text, then continue in ChatGPT. Your coach uses the Tusk plugin to read permitted records and saved preferences. Replies happen in ChatGPT.</p><details className="coach-access"><summary>Choose what this coach can read</summary><p>Its own sector is included. Other sectors need your permission. These controls apply to future context requests; they cannot remove information already shared in a ChatGPT conversation.</p>{SECTORS.filter(source=>source!==config.id).map(source=><label key={source}><input type="checkbox" checked={canRead(source,config.id,permissions)} onChange={()=>toggle(source)}/><span>{source[0].toUpperCase()+source.slice(1)} → {config.name}</span></label>)}</details><Memory coach={config.id} compact/><div className="coach-welcome"><h3>What would you like to work on?</h3><div>{config.prompts.map(prompt=><button key={prompt} onClick={()=>{setInput(prompt);setRequest('');}}>{prompt}</button>)}</div></div><form onSubmit={prepare}><label htmlFor={'coach-'+config.id}>Your question</label><textarea id={'coach-'+config.id} className="tusk-coach-input" value={input} onChange={e=>{setInput(e.target.value);setRequest('');}} maxLength={3000} rows={4} placeholder={'Ask '+config.name+'…'}/><VoiceInput key={config.id} onTranscript={text=>{setInput(current=>(current+(current?' ':'')+text).slice(0,3000));setRequest('');}}/><button className="tusk-sync-button sync-primary" disabled={!input.trim()||isDemo()}>Prepare ChatGPT question</button></form>{error&&<p role="alert">{error}</p>}{request&&<Handoff prompt={request} label="Copy coach question"/>}</section>;
+}

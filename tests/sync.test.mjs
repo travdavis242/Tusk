@@ -1,0 +1,7 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {syncScope,syncSector} from '../lib/sync/service.js';
+import {calendarFile,schoolCalendarItems} from '../lib/sync/calendar.js';
+test('all sync checks exactly four sectors and never fakes success',async()=>{const result=await syncScope('all',{mail:{read:async()=>({status:'setup_required',message:'Connect Google'})}});assert.deepEqual(result.map(r=>r.sector),['school','business','sports','health']);assert.ok(result.every(r=>r.status==='setup_required'&&!r.candidates));});
+test('disconnected Gmail prevents analysis',async()=>{let analyzed=false;await syncSector('school',{mail:{read:async()=>({status:'setup_required'})},analyzer:{analyze(){analyzed=true;}}});assert.equal(analyzed,false);await assert.rejects(syncSector('other'),/Unknown/);});
+test('calendar export includes only dated open tasks, with stable ids and escaped content',()=>{const items=schoolCalendarItems({assignments:[{id:'1',title:'Essay\nEND:VEVENT',due_date:'2026-10-05',due_time:'14:00'},{id:'2',title:'Done',status:'completed',due_date:'2026-10-05'},{id:'3',title:'No date'}],tests:[{id:'4',title:'Test',date:'2026-10-06'}]});assert.equal(items.length,2);const content=calendarFile(items);assert.match(content,/DTSTART;VALUE=DATE:20261005/);assert.match(content,/DTEND;VALUE=DATE:20261006/);assert.match(content,/UID:assignment-1@tusk-school/);assert.match(content,/Essay\\nEND:VEVENT/);assert.equal((content.match(/\r\nBEGIN:VEVENT\r\n/g)||[]).length,2);});

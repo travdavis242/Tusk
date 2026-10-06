@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 * {
   margin: 0;
   padding: 0;
@@ -19,3 +23,38 @@ body {
   min-height: 100vh;
 }
 
+.tusk-home {
+  min-height: max(700px, 100svh);
+}
+
+.tusk-home-layout {
+  width: 620px;
+  height: 560px;
+  max-width: 90vw;
+}
+
+.tusk-sector-node {
+  width: 168px;
+  height: 168px;
+}
+
+.tusk-center-node {
+  width: 190px;
+  height: 190px;
+}
+
+@media (max-width: 639px) {
+  .tusk-home {
+    min-height: max(640px, 100svh);
+  }
+
+  .tusk-sector-node {
+    width: min(36vw, 168px);
+    height: min(36vw, 168px);
+  }
+
+  .tusk-center-node {
+    width: min(42vw, 190px);
+    height: min(42vw, 190px);
+  }
+}

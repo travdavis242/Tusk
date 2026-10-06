@@ -1,11 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import SchoolSector from './SchoolSector';
-import './index.css';
+import TuskRuntime from '../app/Tusk';
+import '../app/globals.css';
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <SchoolSector onBack={() => {}} />
+    <TuskRuntime />
   </React.StrictMode>,
 );
-
